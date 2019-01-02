@@ -1,8 +1,12 @@
 package httpws
 
 import (
+	"bufio"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // deal with sloppy specification variations
@@ -114,5 +118,59 @@ func TestSubprotocols(t *testing.T) {
 	r.Header.Add("Sec-WebSocket-Protocol", "chatv2, chatv3")
 	if got := Subprotocols(r); len(got) != 3 || got[0] != "chat" || got[1] != "chatv2" || got[2] != "chatv3" {
 		t.Errorf(`got %q for "chat" and "chatv2, chatv2"`, got)
+	}
+}
+
+type HijackRecorder struct {
+	httptest.ResponseRecorder
+	Conn net.Conn
+}
+
+func (r *HijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return r.Conn, bufio.NewReadWriter(bufio.NewReader(r.Conn), bufio.NewWriter(r.Conn)), nil
+}
+
+func TestUpgrade(t *testing.T) {
+	req := &http.Request{
+		Header: http.Header{
+			"Host":                   []string{"server.example.com"},
+			"Upgrade":                []string{"websocket"},
+			"Connection":             []string{"Upgrade"},
+			"Sec-Websocket-Key":      []string{"dGhlIHNhbXBsZSBub25jZQ=="},
+			"Origin":                 []string{"http://example.com"},
+			"Sec-WebSocket-Protocol": []string{"chat, superchat"},
+			"Sec-Websocket-Version":  []string{"13"},
+		},
+	}
+
+	testConn, testEnd := net.Pipe()
+	// timeout protection (against hanging tests)
+	time.AfterFunc(2*time.Second, func() { testEnd.Close() })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		resp, err := http.ReadResponse(bufio.NewReader(testEnd), nil)
+		if err != nil {
+			t.Error("test end read error:", err)
+		}
+
+		if resp.StatusCode != 101 {
+			t.Errorf("got HTTP status code %d, want 101", resp.StatusCode)
+		}
+	}()
+
+	var w http.ResponseWriter = &HijackRecorder{*httptest.NewRecorder(), testConn}
+
+	c, err := Upgrade(w, req, nil, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	<-done
+
+	if err := c.Close(); err != nil {
+		t.Error("connection close error:", err)
 	}
 }
