@@ -66,7 +66,8 @@ const (
 	Unexpected = 1011
 )
 
-// ClosedError works around Go issue 4373.
+// ClosedError is a status code. Atomic Close support prevents Go issue 4373.
+// Even after receiving a ClosedError, Conn.Close must still be called.
 type ClosedError uint
 
 // Error honors the error interface.

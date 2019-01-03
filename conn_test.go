@@ -55,7 +55,7 @@ func TestWrite(t *testing.T) {
 
 		// sumbit message
 		ws := Conn{Conn: testConn}
-		ws.WriteFinal(gold.Type)
+		ws.SetWriteMode(gold.Type, true)
 		n, err := ws.Write([]byte(gold.Message))
 		if err != nil {
 			t.Errorf("%#x: connection write error: %s", gold.Frame, err)

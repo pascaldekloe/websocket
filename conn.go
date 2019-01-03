@@ -31,7 +31,14 @@ var errRetry = errors.New("websocket: retry after error with differend payload s
 const AcceptV13 = 1<<Continuation | 1<<Text | 1<<Binary | 1<<Close | 1<<Ping | 1<<Pong
 
 // Conn is a low-level network abstraction confrom the net.Conn interface.
-// Go connections must be read consecutively.
+// Connections must be read consecutively for correct operation and closure.
+//
+// Conn does not act uppon control frames, except for Close. Write returns
+// ClosedError after a Close frame was either send or received. Write also
+// returns ClosedError (with NoStatusCode) when Read got io.EOF without any
+// Close frame occurence.
+//
+// Multiple goroutines may invoke methods on a Conn simultaneously.
 type Conn struct {
 	net.Conn
 	// read & write lock
@@ -70,7 +77,12 @@ type Conn struct {
 	wBuf [127]byte
 }
 
-func (c *Conn) writeClose(statusCode uint, reason string) error {
+// WriteClose sends a Close frame with best-effort. Operation does not block and
+// the return is always a CloseError. When the connectection already received or
+// send a Close then only the first status code remains in effect. The redundant
+// status codes are discarded, including any corresponding Close notifications.
+// Conn.Close must still be called, even after WriteClose.
+func (c *Conn) WriteClose(statusCode uint, reason string) error {
 	if !atomic.CompareAndSwapUint32(&c.statusCode, 0, uint32(statusCode)) {
 		// already closed
 		return c.closeError()
@@ -122,36 +134,39 @@ func (c *Conn) closeError() error {
 	return nil
 }
 
-// WriteFinal sets a Write mode in which each call sends a message of the given
-// content type. The opcode must be in range [1, 15] like Text, Binary or Ping.
+// SetWriteMode controls the send frame/fragment layout. When final, then each
+// Write sends a message of the given type. The opcode must be in range [1, 15]
+// like Text, Binary or Ping.
 //
 //	// send two text messages
-//	c.WriteFinal(websocket.Text)
+//	c.SetWriteMode(websocket.Text, true)
 //	io.WriteString(c, "hello")
 //	io.WriteString(c, "👋")
 //
-// When in streaming mode (with WriteStream), then the first Write call after
-// WriteFinal concludes the message fragments.
+// When not final then each Write sends a fragment of the message until a final
+// Write concludes the message. This mode allows for sending a message that is
+// of unknown size when the message is started without having to buffer. Another
+// use-case is messages that would block the channel for too long, as control
+// frames would have to wait in such case.
 //
 //	// send a binary message/stream
-//	c.WriteStream(websocket.Binary)
+//	c.SetWriteMode(websocket.Binary, false)
 //	io.Copy(c, blob)
-//	c.WriteFinal(websocket.Binary)
+//	c.SetWriteMode(websocket.Binary, true)
 //	c.Write(nil)
 //
-// The opcode from WriteStream applies when at least one Write occurred before
-// Write final. Otherwise the opcode of Write final is used for the last Write.
-// Therefore, it is recommended to use the same opcode on both.
-func (c *Conn) WriteFinal(opcode uint) {
-	head := opcode&opcodeBits | finalFlag
-	atomic.StoreUint32(&c.writeHead, uint32(head))
-}
-
-// WriteStream sets a Write mode in which each call sends the next fragment until
-// WriteFinal is called. The first Write after WriteFinal concludes the message.
-// The opcode must be in range [1, 7] like Text or Binary.
-func (c *Conn) WriteStream(opcode uint) {
-	head := opcode & (opcodeBits &^ ctrlFlag)
+// The opcode is written on the first Write after SetWriteMode. For the previous
+// example, in case Copy did not receive any data, then the opcode of the second
+// call to SetWriteMode would apply. Therefore it is recommended to use the same
+// opcode when finalizing a message.
+func (c *Conn) SetWriteMode(opcode uint, final bool) {
+	head := opcode
+	if final {
+		head &= opcodeBits
+		head |= finalFlag
+	} else {
+		head &= opcodeBits &^ ctrlFlag
+	}
 	atomic.StoreUint32(&c.writeHead, uint32(head))
 }
 
@@ -243,10 +258,8 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 	return len(p) - c.wPayloadN, err
 }
 
-// ReadMode returns state information about message receival. Read spans one
-// message at a time. When final then the last Read concluded the message.
-// The opcode is in range [1, 15]—Continuation is hidden—and the code does not
-// change until a final passed.
+// ReadMode returns state information about the last Read. Read spans one
+// message at a time. Final indicates that message is received in full.
 func (c *Conn) ReadMode() (opcode uint, final bool) {
 	head := uint(atomic.LoadUint32(&c.readHead))
 	opcode = head & opcodeBits
@@ -292,11 +305,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 		if c.rPayloadN != 0 {
 			err = io.ErrUnexpectedEOF
 		}
-		c.writeClose(AbnormalClose, err.Error())
-		if c.rPayloadN == 0 {
-			// delay error
-			err = nil
-		}
+		c.WriteClose(AbnormalClose, err.Error())
 	}
 
 	return
@@ -320,31 +329,31 @@ func (c *Conn) nextFrame() error {
 	if lastHead&headSetFlag != 0 {
 		if lastHead&finalFlag == 0 {
 			if head&opcodeBits != Continuation && head&ctrlFlag == 0 {
-				return c.writeClose(ProtocolError, "fragmented message interrupted")
+				return c.WriteClose(ProtocolError, "fragmented message interrupted")
 			}
 		} else {
 			if head&opcodeBits == Continuation {
-				return c.writeClose(ProtocolError, "continuation of final message")
+				return c.WriteClose(ProtocolError, "continuation of final message")
 			}
 		}
 	}
 
 	if head&reservedBits != 0 {
-		return c.writeClose(ProtocolError, "reserved bit set")
+		return c.WriteClose(ProtocolError, "reserved bit set")
 	}
 
 	// second byte has mask flag and payload size
 	head2 := uint(c.rBuf[1])
 	c.rPayloadN = uint64(head2 & sizeBits)
 	if head2&maskFlag == 0 {
-		return c.writeClose(ProtocolError, "no mask")
+		return c.WriteClose(ProtocolError, "no mask")
 	}
 
 	if head&ctrlFlag == 0 {
 		// non-control frame
 
 		if c.Accept != 0 && c.Accept&1<<(head&opcodeBits) == 0 {
-			return c.writeClose(CannotAccept, "opcode "+string('0'+head&opcodeBits))
+			return c.WriteClose(CannotAccept, "opcode "+string('0'+head&opcodeBits))
 		}
 
 		switch c.rPayloadN {
@@ -373,11 +382,11 @@ func (c *Conn) nextFrame() error {
 	// control frame
 
 	if head&finalFlag == 0 {
-		return c.writeClose(ProtocolError, "control frame not final")
+		return c.WriteClose(ProtocolError, "control frame not final")
 	}
 
 	if c.rPayloadN > 125 {
-		return c.writeClose(ProtocolError, "control frame size")
+		return c.WriteClose(ProtocolError, "control frame size")
 	}
 
 	if err := c.ensureBufN(int(c.rPayloadN) + 6); err != nil {
@@ -390,9 +399,9 @@ func (c *Conn) nextFrame() error {
 
 	if head&opcodeBits == Close {
 		if c.rPayloadN < 2 {
-			return c.writeClose(NoStatusCode, "")
+			return c.WriteClose(NoStatusCode, "")
 		}
-		return c.writeClose(uint(binary.BigEndian.Uint16(c.rBuf[6:8])), string(c.rBuf[8:c.rBufN]))
+		return c.WriteClose(uint(binary.BigEndian.Uint16(c.rBuf[6:8])), string(c.rBuf[8:c.rBufN]))
 	}
 
 	return nil
@@ -413,7 +422,7 @@ func (c *Conn) ensureBufN(n int) error {
 				if c.rBufN != 0 {
 					err = io.ErrUnexpectedEOF
 				}
-				c.writeClose(AbnormalClose, err.Error())
+				c.WriteClose(AbnormalClose, err.Error())
 				if c.rBufN >= n {
 					return nil
 				}
