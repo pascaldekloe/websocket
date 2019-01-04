@@ -175,8 +175,12 @@ func (c *Conn) SetWriteMode(opcode uint, final bool) {
 // Zero payload causes an empty frame/fragment.
 func (c *Conn) Write(p []byte) (n int, err error) {
 	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
+	n, err = c.write(p)
+	c.writeMutex.Unlock()
+	return
+}
 
+func (c *Conn) write(p []byte) (n int, err error) {
 	if err := c.closeError(); err != nil {
 		return 0, err
 	}
@@ -270,8 +274,12 @@ func (c *Conn) ReadMode() (opcode uint, final bool) {
 // updated on each call.
 func (c *Conn) Read(p []byte) (n int, err error) {
 	c.readMutex.Lock()
-	defer c.readMutex.Unlock()
+	n, err = c.read(p)
+	c.readMutex.Unlock()
+	return
+}
 
+func (c *Conn) read(p []byte) (n int, err error) {
 	if c.readPayloadN == 0 {
 		err := c.nextFrame()
 		if err != nil {
