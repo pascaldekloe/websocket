@@ -36,7 +36,7 @@ const AcceptV13 = 1<<Continuation | 1<<Text | 1<<Binary | 1<<Close | 1<<Ping | 1
 // Conn does not act uppon control frames, except for Close. Write returns
 // ClosedError after a Close frame was either send or received. Write also
 // returns ClosedError (with NoStatusCode) when Read got io.EOF without any
-// Close frame occurence.
+// Close frame occurrence.
 //
 // Multiple goroutines may invoke methods on a Conn simultaneously.
 type Conn struct {
@@ -45,8 +45,7 @@ type Conn struct {
 	rMux, wMux sync.Mutex
 
 	// pending number of bytes
-	rPayloadN uint64
-	wPayloadN int
+	rPayloadN, wPayloadN int
 
 	// When not zero, then receival of opcodes without a flag are rejected
 	// with a connection Close, status code 1003—CannotAccept. Flags follow
@@ -281,7 +280,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 	}
 
 	// limit read to payload size
-	if uint64(len(p)) > c.rPayloadN {
+	if len(p) > c.rPayloadN {
 		p = p[:c.rPayloadN]
 	}
 
@@ -295,7 +294,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 		n += done
 	}
 	// register result
-	c.rPayloadN -= uint64(n)
+	c.rPayloadN -= n
 
 	// deal with payload
 	c.unmaskN(p[:n])
@@ -344,7 +343,7 @@ func (c *Conn) nextFrame() error {
 
 	// second byte has mask flag and payload size
 	head2 := uint(c.rBuf[1])
-	c.rPayloadN = uint64(head2 & sizeBits)
+	c.rPayloadN = int(head2 & sizeBits)
 	if head2&maskFlag == 0 {
 		return c.WriteClose(ProtocolError, "no mask")
 	}
@@ -364,14 +363,18 @@ func (c *Conn) nextFrame() error {
 			if err := c.ensureBufN(8); err != nil {
 				return err
 			}
-			c.rPayloadN = uint64(binary.BigEndian.Uint16(c.rBuf[2:4]))
+			c.rPayloadN = int(binary.BigEndian.Uint16(c.rBuf[2:4]))
 			c.mask = maskOrder.Uint32(c.rBuf[4:8])
 			c.rBufDone = 8
 		case 127:
 			if err := c.ensureBufN(14); err != nil {
 				return err
 			}
-			c.rPayloadN = binary.BigEndian.Uint64(c.rBuf[2:10])
+			size := binary.BigEndian.Uint64(c.rBuf[2:10])
+			if size > uint64((^uint(0))>>1) {
+				return c.WriteClose(TooBig, "word size exceeded")
+			}
+			c.rPayloadN = int(size)
 			c.mask = maskOrder.Uint32(c.rBuf[10:14])
 			c.rBufDone = 14
 		}
@@ -389,13 +392,13 @@ func (c *Conn) nextFrame() error {
 		return c.WriteClose(ProtocolError, "control frame size")
 	}
 
-	if err := c.ensureBufN(int(c.rPayloadN) + 6); err != nil {
+	if err := c.ensureBufN(c.rPayloadN + 6); err != nil {
 		return err
 	}
 	c.mask = maskOrder.Uint32(c.rBuf[2:6])
 	c.maskI = 0
 	c.rBufDone = 6
-	c.unmaskN(c.rBuf[6 : 6+int(c.rPayloadN)])
+	c.unmaskN(c.rBuf[6 : 6+c.rPayloadN])
 
 	if head&opcodeBits == Close {
 		if c.rPayloadN < 2 {
