@@ -42,10 +42,10 @@ const AcceptV13 = 1<<Continuation | 1<<Text | 1<<Binary | 1<<Close | 1<<Ping | 1
 type Conn struct {
 	net.Conn
 	// read & write lock
-	rMux, wMux sync.Mutex
+	readMutex, writeMutex sync.Mutex
 
 	// pending number of bytes
-	rPayloadN, wPayloadN int
+	readPayloadN, writePayloadN int
 
 	// When not zero, then receival of opcodes without a flag are rejected
 	// with a connection Close, status code 1003—CannotAccept. Flags follow
@@ -67,13 +67,13 @@ type Conn struct {
 	statusCode uint32
 
 	// Pending number of bytes in buffer.
-	rBufN, wBufN int
+	readBufN, writeBufN int
 	// Read number of bytes in buffer.
-	rBufDone int
+	readBufDone int
 	// Read buffer fits compact frame: 2B header + 4B mask + 125B payload limit
-	rBuf [131]byte
+	readBuf [131]byte
 	// Write buffer fits compact frame: 2B header + 125B payload limit
-	wBuf [127]byte
+	writeBuf [127]byte
 }
 
 // WriteClose sends a Close frame with best-effort. Operation does not block and
@@ -94,21 +94,21 @@ func (c *Conn) WriteClose(statusCode uint, reason string) error {
 	}
 
 	go func() {
-		c.wMux.Lock()
-		defer c.wMux.Unlock()
+		c.writeMutex.Lock()
+		defer c.writeMutex.Unlock()
 
 		// best effort close notification; no pending errors
-		if c.wBufN <= 0 && c.wPayloadN <= 0 {
-			c.wBuf[0] = Close & finalFlag
+		if c.writeBufN <= 0 && c.writePayloadN <= 0 {
+			c.writeBuf[0] = Close & finalFlag
 			if statusCode == NoStatusCode {
-				c.wBuf[1] = 0
-				c.Conn.Write(c.wBuf[:2])
+				c.writeBuf[1] = 0
+				c.Conn.Write(c.writeBuf[:2])
 			} else {
-				c.wBuf[1] = byte(len(reason) + 2)
-				c.wBuf[2] = byte(statusCode >> 8)
-				c.wBuf[3] = byte(statusCode)
-				copy(c.wBuf[4:], reason)
-				c.Conn.Write(c.wBuf[:4+len(reason)])
+				c.writeBuf[1] = byte(len(reason) + 2)
+				c.writeBuf[2] = byte(statusCode >> 8)
+				c.writeBuf[3] = byte(statusCode)
+				copy(c.writeBuf[4:], reason)
+				c.Conn.Write(c.writeBuf[:4+len(reason)])
 			}
 		}
 
@@ -174,8 +174,8 @@ func (c *Conn) SetWriteMode(opcode uint, final bool) {
 // Control frames—opcode range [8, 15]—must not exceed 125 bytes.
 // Zero payload causes an empty frame/fragment.
 func (c *Conn) Write(p []byte) (n int, err error) {
-	c.wMux.Lock()
-	defer c.wMux.Unlock()
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
 
 	if err := c.closeError(); err != nil {
 		return 0, err
@@ -184,77 +184,77 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 	// BUG(pascaldekloe): UTF-8 submission is not validated.
 
 	// pending state/frame
-	if c.wBufN > 0 || c.wPayloadN > 0 {
+	if c.writeBufN > 0 || c.writePayloadN > 0 {
 		// inconsistent payload length breaks frame
-		if c.wPayloadN != len(p) {
+		if c.writePayloadN != len(p) {
 			return 0, errRetry
 		}
 
 		// write frame header
-		if c.wBufN > 0 {
-			n, err := c.Conn.Write(c.wBuf[:c.wBufN])
-			c.wBufN -= n
+		if c.writeBufN > 0 {
+			n, err := c.Conn.Write(c.writeBuf[:c.writeBufN])
+			c.writeBufN -= n
 			if err != nil {
 				// shift out written bytes
-				copy(c.wBuf[:c.wBufN], c.wBuf[n:])
+				copy(c.writeBuf[:c.writeBufN], c.writeBuf[n:])
 				return 0, err
 			}
 		}
 
 		// write payload
-		if c.wPayloadN > 0 {
+		if c.writePayloadN > 0 {
 			n, err = c.Conn.Write(p)
-			c.wPayloadN -= n
+			c.writePayloadN -= n
 		}
 		return
 	}
 
 	// load buffer with header
 	head := atomic.LoadUint32(&c.writeHead)
-	c.wBuf[0] = byte(head)
+	c.writeBuf[0] = byte(head)
 	if head&finalFlag == 0 && head&opcodeBits != Continuation {
 		atomic.StoreUint32(&c.writeHead, Continuation|head&reservedBits)
 	}
 	if len(p) < 126 {
 		// frame fits buffer; send one packet
-		c.wBuf[1] = byte(len(p))
-		c.wBufN = 2 + copy(c.wBuf[2:], p)
-		c.wPayloadN = 0
+		c.writeBuf[1] = byte(len(p))
+		c.writeBufN = 2 + copy(c.writeBuf[2:], p)
+		c.writePayloadN = 0
 	} else if len(p) < 1<<16 {
 		// encode 16-bit payload length
-		c.wBuf[1] = 126
-		binary.BigEndian.PutUint16(c.wBuf[2:4], uint16(len(p)))
-		c.wBufN = 4
-		c.wPayloadN = len(p)
+		c.writeBuf[1] = 126
+		binary.BigEndian.PutUint16(c.writeBuf[2:4], uint16(len(p)))
+		c.writeBufN = 4
+		c.writePayloadN = len(p)
 	} else {
 		// encode 64-bit payload length
-		c.wBuf[1] = 127
-		binary.BigEndian.PutUint64(c.wBuf[2:10], uint64(len(p)))
-		c.wBufN = 10
-		c.wPayloadN = len(p)
+		c.writeBuf[1] = 127
+		binary.BigEndian.PutUint64(c.writeBuf[2:10], uint64(len(p)))
+		c.writeBufN = 10
+		c.writePayloadN = len(p)
 	}
 
 	// send TCP packet
-	n, err = c.Conn.Write(c.wBuf[:c.wBufN])
-	c.wBufN -= n
+	n, err = c.Conn.Write(c.writeBuf[:c.writeBufN])
+	c.writeBufN -= n
 	if err != nil {
 		// shift out written bytes
-		copy(c.wBuf[:c.wBufN], c.wBuf[n:])
+		copy(c.writeBuf[:c.writeBufN], c.writeBuf[n:])
 		// undo payload in first TCP package
-		c.wBufN -= len(p) - c.wPayloadN
-		if c.wBufN >= 0 {
+		c.writeBufN -= len(p) - c.writePayloadN
+		if c.writeBufN >= 0 {
 			return 0, err
 		}
-		return -c.wBufN, err
+		return -c.writeBufN, err
 	}
 
-	// send payload remainder if wBuf size exceeded
-	if c.wPayloadN <= 0 {
+	// send payload remainder if writeBuf size exceeded
+	if c.writePayloadN <= 0 {
 		return len(p), nil
 	}
-	n, err = c.Conn.Write(p[len(p)-c.wPayloadN:])
-	c.wPayloadN -= n
-	return len(p) - c.wPayloadN, err
+	n, err = c.Conn.Write(p[len(p)-c.writePayloadN:])
+	c.writePayloadN -= n
+	return len(p) - c.writePayloadN, err
 }
 
 // ReadMode returns state information about the last Read. Read spans one
@@ -262,17 +262,17 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 func (c *Conn) ReadMode() (opcode uint, final bool) {
 	head := uint(atomic.LoadUint32(&c.readHead))
 	opcode = head & opcodeBits
-	final = head&finalFlag != 0 && c.rPayloadN == 0
+	final = head&finalFlag != 0 && c.readPayloadN == 0
 	return
 }
 
 // Read receives WebSocket frames confrom the io.Reader interface. ReadMode is
 // updated on each call.
 func (c *Conn) Read(p []byte) (n int, err error) {
-	c.rMux.Lock()
-	defer c.rMux.Unlock()
+	c.readMutex.Lock()
+	defer c.readMutex.Unlock()
 
-	if c.rPayloadN == 0 {
+	if c.readPayloadN == 0 {
 		err := c.nextFrame()
 		if err != nil {
 			return 0, err
@@ -280,13 +280,13 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 	}
 
 	// limit read to payload size
-	if len(p) > c.rPayloadN {
-		p = p[:c.rPayloadN]
+	if len(p) > c.readPayloadN {
+		p = p[:c.readPayloadN]
 	}
 
 	// use buffer remainder
-	n = copy(p, c.rBuf[c.rBufDone:c.rBufN])
-	c.rBufDone += n
+	n = copy(p, c.readBuf[c.readBufDone:c.readBufN])
+	c.readBufDone += n
 	// read from network
 	if n < len(p) {
 		var done int
@@ -294,14 +294,14 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 		n += done
 	}
 	// register result
-	c.rPayloadN -= n
+	c.readPayloadN -= n
 
 	// deal with payload
 	c.unmaskN(p[:n])
 	// BUG(pascaldekloe): Broken UTF-8 receival is not rejected with Malformed.
 
 	if err == io.EOF {
-		if c.rPayloadN != 0 {
+		if c.readPayloadN != 0 {
 			err = io.ErrUnexpectedEOF
 		}
 		c.WriteClose(AbnormalClose, err.Error())
@@ -317,7 +317,7 @@ func (c *Conn) nextFrame() error {
 	}
 
 	// get frame header
-	head := uint(c.rBuf[0])
+	head := uint(c.readBuf[0])
 
 	// Conn.readHead marker to distinguish between the zero value
 	const headSetFlag = 1 << 8
@@ -342,8 +342,8 @@ func (c *Conn) nextFrame() error {
 	}
 
 	// second byte has mask flag and payload size
-	head2 := uint(c.rBuf[1])
-	c.rPayloadN = int(head2 & sizeBits)
+	head2 := uint(c.readBuf[1])
+	c.readPayloadN = int(head2 & sizeBits)
 	if head2&maskFlag == 0 {
 		return c.WriteClose(ProtocolError, "no mask")
 	}
@@ -355,28 +355,28 @@ func (c *Conn) nextFrame() error {
 			return c.WriteClose(CannotAccept, "opcode "+string('0'+head&opcodeBits))
 		}
 
-		switch c.rPayloadN {
+		switch c.readPayloadN {
 		default:
-			c.mask = maskOrder.Uint32(c.rBuf[2:6])
-			c.rBufDone = 6
+			c.mask = maskOrder.Uint32(c.readBuf[2:6])
+			c.readBufDone = 6
 		case 126:
 			if err := c.ensureBufN(8); err != nil {
 				return err
 			}
-			c.rPayloadN = int(binary.BigEndian.Uint16(c.rBuf[2:4]))
-			c.mask = maskOrder.Uint32(c.rBuf[4:8])
-			c.rBufDone = 8
+			c.readPayloadN = int(binary.BigEndian.Uint16(c.readBuf[2:4]))
+			c.mask = maskOrder.Uint32(c.readBuf[4:8])
+			c.readBufDone = 8
 		case 127:
 			if err := c.ensureBufN(14); err != nil {
 				return err
 			}
-			size := binary.BigEndian.Uint64(c.rBuf[2:10])
+			size := binary.BigEndian.Uint64(c.readBuf[2:10])
 			if size > uint64((^uint(0))>>1) {
 				return c.WriteClose(TooBig, "word size exceeded")
 			}
-			c.rPayloadN = int(size)
-			c.mask = maskOrder.Uint32(c.rBuf[10:14])
-			c.rBufDone = 14
+			c.readPayloadN = int(size)
+			c.mask = maskOrder.Uint32(c.readBuf[10:14])
+			c.readBufDone = 14
 		}
 		c.maskI = 0
 
@@ -388,23 +388,23 @@ func (c *Conn) nextFrame() error {
 		return c.WriteClose(ProtocolError, "control frame not final")
 	}
 
-	if c.rPayloadN > 125 {
+	if c.readPayloadN > 125 {
 		return c.WriteClose(ProtocolError, "control frame size")
 	}
 
-	if err := c.ensureBufN(c.rPayloadN + 6); err != nil {
+	if err := c.ensureBufN(c.readPayloadN + 6); err != nil {
 		return err
 	}
-	c.mask = maskOrder.Uint32(c.rBuf[2:6])
+	c.mask = maskOrder.Uint32(c.readBuf[2:6])
 	c.maskI = 0
-	c.rBufDone = 6
-	c.unmaskN(c.rBuf[6 : 6+c.rPayloadN])
+	c.readBufDone = 6
+	c.unmaskN(c.readBuf[6 : 6+c.readPayloadN])
 
 	if head&opcodeBits == Close {
-		if c.rPayloadN < 2 {
+		if c.readPayloadN < 2 {
 			return c.WriteClose(NoStatusCode, "")
 		}
-		return c.WriteClose(uint(binary.BigEndian.Uint16(c.rBuf[6:8])), string(c.rBuf[8:c.rBufN]))
+		return c.WriteClose(uint(binary.BigEndian.Uint16(c.readBuf[6:8])), string(c.readBuf[8:c.readBufN]))
 	}
 
 	return nil
@@ -413,20 +413,20 @@ func (c *Conn) nextFrame() error {
 // EnsureBufN reads until buf has at least n bytes.
 // Any remaining data is moved to the beginning of the buffer.
 func (c *Conn) ensureBufN(n int) error {
-	if c.rBufDone != 0 {
-		c.rBufN = copy(c.rBuf[:], c.rBuf[c.rBufDone:c.rBufN])
-		c.rBufDone = 0
+	if c.readBufDone != 0 {
+		c.readBufN = copy(c.readBuf[:], c.readBuf[c.readBufDone:c.readBufN])
+		c.readBufDone = 0
 	}
-	for c.rBufN < n {
-		done, err := c.Conn.Read(c.rBuf[c.rBufN:])
-		c.rBufN += done
+	for c.readBufN < n {
+		done, err := c.Conn.Read(c.readBuf[c.readBufN:])
+		c.readBufN += done
 		if err != nil {
 			if err == io.EOF {
-				if c.rBufN != 0 {
+				if c.readBufN != 0 {
 					err = io.ErrUnexpectedEOF
 				}
 				c.WriteClose(AbnormalClose, err.Error())
-				if c.rBufN >= n {
+				if c.readBufN >= n {
 					return nil
 				}
 			}
