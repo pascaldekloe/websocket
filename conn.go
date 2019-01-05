@@ -30,15 +30,16 @@ var errRetry = errors.New("websocket: retry after error with differend payload s
 // AcceptV13 is a Conn.Accept value for all non-reserved opcodes from version 13.
 const AcceptV13 = 1<<Continuation | 1<<Text | 1<<Binary | 1<<Close | 1<<Ping | 1<<Pong
 
-// Conn is a low-level network abstraction confrom the net.Conn interface.
+// Conn offers a low-level network abstraction confrom the net.Conn interface.
+// These opeartions do not act uppon control frames, except for Close. Write
+// returns a ClosedError after a Close frame was either send or received. Write
+// also returns a ClosedError (with NoStatusCode) when Read got io.EOF without
+// any Close frame occurrence. Multiple goroutines may invoke net.Conn methods
+// simultaneously.
+//
+// Conn also offers high-level abstraction with the Receive and Send methods.
+//
 // Connections must be read consecutively for correct operation and closure.
-//
-// Conn does not act uppon control frames, except for Close. Write returns
-// ClosedError after a Close frame was either send or received. Write also
-// returns ClosedError (with NoStatusCode) when Read got io.EOF without any
-// Close frame occurrence.
-//
-// Multiple goroutines may invoke methods on a Conn simultaneously.
 type Conn struct {
 	net.Conn
 	// read & write lock

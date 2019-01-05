@@ -105,9 +105,14 @@ var pongFrame = []byte{Pong | finalFlag, 0}
 
 // Receive is a high-level abstraction (from Read) for safety and convenience.
 // The opcode return is in range [1, 7]. Control frames are dealed with.
+// Size defines the amount of bytes in Reader or negative when unknown.
 //
-// Receive must be called sequential; no interruptions from Receive nor Read.
-// The Reader must be fully consumed [io.EOF] until the next call to Receive.
+// Receive must be called sequentially. Reader must be fully consumed before
+// the next call to Receive. Interruptions from other calls to Receive or Read
+// may cause protocol violations.
+//
+// WireTimeout is the limit for Read [frame receival] and idleTimeout limits
+// the amount of time to wait for arrival.
 func (c *Conn) Receive(wireTimeout, idleTimeout time.Duration) (opcode uint, r io.Reader, size int, err error) {
 	for {
 		c.SetReadDeadline(time.Now().Add(idleTimeout))
@@ -214,7 +219,9 @@ func (r *messageReader) Read(p []byte) (n int, err error) {
 }
 
 // Send is a high-level abstraction (from Write) for safety and convenience.
-// WireTimeout is the maximum submission time.
+// Operation must complete before any other call is made to either Send,
+// SendStream, Write or WriteMode.
+// WireTimeout is the limit for Write [frame submission].
 func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) error {
 	c.SetWriteMode(opcode, true)
 
@@ -241,7 +248,9 @@ func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) erro
 }
 
 // Send is a high-level abstraction (from Write) for safety and convenience.
-// WireTimeout is the maximum submission time for each frame [Write or Close].
+// The stream must be closed before any other call is made to either SendStream,
+// Send, Write or WriteMode.
+// WireTimeout is the limit for Write and Close [frame submission].
 func (c *Conn) SendStream(opcode uint, wireTimeout time.Duration) io.WriteCloser {
 	c.SetWriteMode(opcode, false)
 	return &messageWriter{conn: c, wireTimeout: wireTimeout}
