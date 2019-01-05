@@ -45,6 +45,7 @@ var (
 
 	UpgradeHeaders = [][]string{
 		[]string{"websocket"},
+		[]string{"WebSocket"},
 		[]string{"websocket/13"},
 
 		[]string{"a,websocket"},
@@ -67,9 +68,8 @@ var (
 	}
 	NotUpgradeHeaders = [][]string{
 		nil,
-		[]string{"WebSocket"},
 		[]string{"websocket/12"},
-		[]string{"websocket/14"},
+		[]string{"WebSocket/14"},
 		[]string{"awebsocket, b"},
 		[]string{"a, bwebsocket"},
 	}

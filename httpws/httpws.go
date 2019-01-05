@@ -44,8 +44,8 @@ func isUpgradeWebSocket(r *http.Request) bool {
 	for i, c := range header {
 		switch c {
 		case ',', ' ', '\t':
-			switch header[offset:i] {
-			case "websocket", "websocket/13":
+			s := header[offset:i]
+			if strings.EqualFold("websocket", s) || strings.EqualFold("websocket/13", s) {
 				return true
 			}
 
@@ -53,8 +53,8 @@ func isUpgradeWebSocket(r *http.Request) bool {
 		}
 	}
 
-	switch header[offset:] {
-	case "websocket", "websocket/13":
+	s := header[offset:]
+	if strings.EqualFold("websocket", s) || strings.EqualFold("websocket/13", s) {
 		return true
 	}
 	return false
