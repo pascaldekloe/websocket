@@ -2,6 +2,7 @@
 package websocket
 
 import (
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -103,6 +104,9 @@ func (e ClosedError) Temporary() bool { return false }
 
 var pongFrame = []byte{Pong | finalFlag, 0}
 
+// ErrOverflow signals an incomming message larger than the provided buffer.
+var ErrOverflow = errors.New("websocket: message exceeds buffer size")
+
 // Receive is a high-level abstraction (from Read) for safety and convenience.
 // The opcode return is in range [1, 7]. Control frames are dealed with.
 // Size defines the amount of bytes in Reader or negative when unknown.
@@ -113,20 +117,17 @@ var pongFrame = []byte{Pong | finalFlag, 0}
 //
 // WireTimeout is the limit for Read [frame receival] and idleTimeout limits
 // the amount of time to wait for arrival.
-func (c *Conn) Receive(wireTimeout, idleTimeout time.Duration) (opcode uint, r io.Reader, size int, err error) {
+func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opcode uint, n int, err error) {
 	for {
 		c.SetReadDeadline(time.Now().Add(idleTimeout))
 		_, err := c.Read(nil)
 		for err != nil {
 			e, ok := err.(net.Error)
-			if !ok {
-				return 0, nil, 0, err
+			if ok && e.Timeout() {
+				c.WriteClose(Policy, "idle timeout")
 			}
-			if e.Timeout() {
-				return 0, nil, 0, c.WriteClose(Policy, "idle timout")
-			}
-			if !e.Temporary() {
-				return 0, nil, 0, err
+			if !ok || !e.Temporary() {
+				return 0, 0, err
 			}
 
 			time.Sleep(100 * time.Microsecond)
@@ -135,13 +136,11 @@ func (c *Conn) Receive(wireTimeout, idleTimeout time.Duration) (opcode uint, r i
 
 		opcode, final := c.ReadMode()
 
+		// deal with conrol frames
 		if opcode&ctrlFlag != 0 {
-			// TODO: retries + optimise flush with c.readBuf
-			var buf [125]byte
-			_, err := c.read(buf[:])
-			if err != nil {
-				return 0, nil, 0, err
-			}
+			// received in buffer; flush payload
+			c.readBufDone += c.readPayloadN
+			c.readPayloadN = 0
 
 			// react
 			switch opcode {
@@ -153,25 +152,94 @@ func (c *Conn) Receive(wireTimeout, idleTimeout time.Duration) (opcode uint, r i
 				}()
 			}
 
-			c.SetReadDeadline(time.Now().Add(idleTimeout))
+			continue
+		}
+
+		c.SetReadDeadline(time.Now().Add(wireTimeout))
+		for !final {
+			if n >= len(buf) {
+				return opcode, n, ErrOverflow
+			}
+
+			var more int
+			more, err := c.Read(buf[n:])
+			n += more
+			if err != nil {
+				e, ok := err.(net.Error)
+				if ok && e.Timeout() {
+					c.WriteClose(Policy, "read timeout")
+				}
+				if !ok || !e.Temporary() {
+					return 0, 0, err
+				}
+
+				time.Sleep(100 * time.Microsecond)
+				continue
+			}
+
+			_, final = c.ReadMode()
+		}
+
+		return opcode, n, nil
+	}
+}
+
+// ReceiveStream is a high-level abstraction (from Read) for safety and
+// convenience. The opcode return is in range [1, 7]. Control frames are dealed
+// with.
+//
+// Receive must be called sequentially. Reader must be fully consumed before
+// the next call to Receive. Interruptions from other calls to Receive or Read
+// may cause protocol violations.
+//
+// WireTimeout is the limit for Read [frame receival] and idleTimeout limits
+// the amount of time to wait for arrival.
+func (c *Conn) ReceiveStream(wireTimeout, idleTimeout time.Duration) (opcode uint, r io.Reader, err error) {
+	for {
+		c.SetReadDeadline(time.Now().Add(idleTimeout))
+		_, err := c.Read(nil)
+		for err != nil {
+			e, ok := err.(net.Error)
+			if ok && e.Timeout() {
+				c.WriteClose(Policy, "idle timeout")
+			}
+			if !ok || !e.Temporary() {
+				return 0, nil, err
+			}
+
+			time.Sleep(100 * time.Microsecond)
+			_, err = c.Read(nil)
+		}
+
+		opcode, final := c.ReadMode()
+
+		// deal with conrol frames
+		if opcode&ctrlFlag != 0 {
+			// received in buffer; flush payload
+			c.readBufDone += c.readPayloadN
+			c.readPayloadN = 0
+
+			// react
+			switch opcode {
+			case Ping:
+				go func() {
+					c.writeMutex.Lock()
+					c.Conn.Write(pongFrame)
+					c.writeMutex.Unlock()
+				}()
+			}
+
 			continue
 		}
 
 		if final {
-			return opcode, readEOF{}, 0, nil
+			return opcode, readEOF{}, nil
 		}
-
-		size := -1
-		if c.readHead&finalFlag != 0 {
-			size = c.readPayloadN
-		}
-
-		r := &messageReader{
+		return opcode, &messageReader{
 			conn:        c,
 			wireTimeout: wireTimeout,
 			idleTimeout: idleTimeout,
-		}
-		return opcode, r, size, nil
+		}, nil
 	}
 }
 
@@ -188,26 +256,20 @@ func (r *messageReader) Read(p []byte) (n int, err error) {
 	}
 
 	r.conn.SetReadDeadline(time.Now().Add(r.wireTimeout))
-	n, err = r.conn.read(p)
+	n, err = r.conn.Read(p)
 	for err != nil {
 		e, ok := err.(net.Error)
-		if !ok {
-			r.err = err
-			return
+		if ok && e.Timeout() {
+			r.conn.WriteClose(Policy, "read timeout")
 		}
-		if e.Timeout() {
-			err = r.conn.WriteClose(Policy, "read timout")
-			r.err = err
-			return
-		}
-		if !e.Temporary() {
+		if !ok || !e.Temporary() {
 			r.err = err
 			return
 		}
 
 		time.Sleep(100 * time.Microsecond)
 		var more int
-		more, err = r.conn.read(p[n:])
+		more, err = r.conn.Read(p[n:])
 		n += more
 	}
 
@@ -229,13 +291,10 @@ func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) erro
 	n, err := c.Write(message)
 	for err != nil {
 		e, ok := err.(net.Error)
-		if !ok {
-			return err
+		if ok && e.Timeout() {
+			c.WriteClose(Policy, "write timeout")
 		}
-		if e.Timeout() {
-			return c.WriteClose(Policy, "write timout")
-		}
-		if !e.Temporary() {
+		if !ok || !e.Temporary() {
 			return err
 		}
 
@@ -271,14 +330,10 @@ func (w *messageWriter) Write(p []byte) (n int, err error) {
 	n, err = w.conn.Write(p)
 	for err != nil {
 		e, ok := err.(net.Error)
-		if !ok {
-			return
+		if ok && e.Timeout() {
+			w.conn.WriteClose(Policy, "write timeout")
 		}
-		if e.Timeout() {
-			err = w.conn.WriteClose(Policy, "write timout")
-			return
-		}
-		if !e.Temporary() {
+		if !ok || !e.Temporary() {
 			return
 		}
 
