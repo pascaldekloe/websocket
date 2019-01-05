@@ -12,15 +12,15 @@ import (
 
 // first (frame) byte layout
 const (
-	opcodeBits   = 0x0f
+	opcodeMask   = 0x0f
 	ctrlFlag     = 0x08
-	reservedBits = 0x70
+	reservedMask = 0x70
 	finalFlag    = 0x80
 )
 
 // second (frame) byte layout
 const (
-	sizeBits = 0x7f
+	sizeMask = 0x7f
 	maskFlag = 0x80
 )
 
@@ -161,10 +161,10 @@ func (c *Conn) closeError() error {
 func (c *Conn) SetWriteMode(opcode uint, final bool) {
 	head := opcode
 	if final {
-		head &= opcodeBits
+		head &= opcodeMask
 		head |= finalFlag
 	} else {
-		head &= opcodeBits &^ ctrlFlag
+		head &= opcodeMask &^ ctrlFlag
 	}
 	atomic.StoreUint32(&c.writeHead, uint32(head))
 }
@@ -216,8 +216,8 @@ func (c *Conn) write(p []byte) (n int, err error) {
 	// load buffer with header
 	head := atomic.LoadUint32(&c.writeHead)
 	c.writeBuf[0] = byte(head)
-	if head&finalFlag == 0 && head&opcodeBits != Continuation {
-		atomic.StoreUint32(&c.writeHead, Continuation|head&reservedBits)
+	if head&finalFlag == 0 && head&opcodeMask != Continuation {
+		atomic.StoreUint32(&c.writeHead, Continuation|head&reservedMask)
 	}
 	if len(p) < 126 {
 		// frame fits buffer; send one packet
@@ -265,7 +265,7 @@ func (c *Conn) write(p []byte) (n int, err error) {
 // message at a time. Final indicates that message is received in full.
 func (c *Conn) ReadMode() (opcode uint, final bool) {
 	head := uint(atomic.LoadUint32(&c.readHead))
-	opcode = head & opcodeBits
+	opcode = head & opcodeMask
 	final = head&finalFlag != 0 && c.readPayloadN == 0
 	return
 }
@@ -335,23 +335,23 @@ func (c *Conn) nextFrame() error {
 	// sequence validation
 	if lastHead&headSetFlag != 0 {
 		if lastHead&finalFlag == 0 {
-			if head&opcodeBits != Continuation && head&ctrlFlag == 0 {
+			if head&opcodeMask != Continuation && head&ctrlFlag == 0 {
 				return c.WriteClose(ProtocolError, "fragmented message interrupted")
 			}
 		} else {
-			if head&opcodeBits == Continuation {
+			if head&opcodeMask == Continuation {
 				return c.WriteClose(ProtocolError, "continuation of final message")
 			}
 		}
 	}
 
-	if head&reservedBits != 0 {
+	if head&reservedMask != 0 {
 		return c.WriteClose(ProtocolError, "reserved bit set")
 	}
 
 	// second byte has mask flag and payload size
 	head2 := uint(c.readBuf[1])
-	c.readPayloadN = int(head2 & sizeBits)
+	c.readPayloadN = int(head2 & sizeMask)
 	if head2&maskFlag == 0 {
 		return c.WriteClose(ProtocolError, "no mask")
 	}
@@ -359,8 +359,8 @@ func (c *Conn) nextFrame() error {
 	if head&ctrlFlag == 0 {
 		// non-control frame
 
-		if c.Accept != 0 && c.Accept&1<<(head&opcodeBits) == 0 {
-			return c.WriteClose(CannotAccept, "opcode "+string('0'+head&opcodeBits))
+		if c.Accept != 0 && c.Accept&1<<(head&opcodeMask) == 0 {
+			return c.WriteClose(CannotAccept, "opcode "+string('0'+head&opcodeMask))
 		}
 
 		switch c.readPayloadN {
@@ -408,7 +408,7 @@ func (c *Conn) nextFrame() error {
 	c.readBufDone = 6
 	c.unmaskN(c.readBuf[6 : 6+c.readPayloadN])
 
-	if head&opcodeBits == Close {
+	if head&opcodeMask == Close {
 		if c.readPayloadN < 2 {
 			return c.WriteClose(NoStatusCode, "")
 		}

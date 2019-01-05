@@ -3,5 +3,7 @@
 
 A WebSocket library for the Go programming language.
 
+Work-in-progress; DO NOT USE.
+
 This is free and unencumbered software released into the
 [public domain](http://creativecommons.org/publicdomain/zero/1.0).
