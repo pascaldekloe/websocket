@@ -1,6 +1,12 @@
 // Package websocket implements “The WebSocket Protocol” RFC 6455, version 13.
 package websocket
 
+import (
+	"io"
+	"net"
+	"time"
+)
+
 // Opcode defines the interpretation of a frame payload.
 const (
 	// Continuation for streaming data.
@@ -94,3 +100,211 @@ func (e ClosedError) Timeout() bool { return false }
 
 // Temporary honors the net.Error interface.
 func (e ClosedError) Temporary() bool { return false }
+
+var pongFrame = []byte{Pong | finalFlag, 0}
+
+// Receive is a high-level abstraction (from Read) for safety and convenience.
+// The opcode return is in range [1, 7]. Control frames are dealed with.
+//
+// Receive must be called sequential; no interruptions from Receive nor Read.
+// The Reader must be fully consumed [io.EOF] until the next call to Receive.
+func (c *Conn) Receive(wireTimeout, idleTimeout time.Duration) (opcode uint, r io.Reader, size int, err error) {
+	for {
+		c.SetReadDeadline(time.Now().Add(idleTimeout))
+		_, err := c.Read(nil)
+		for err != nil {
+			e, ok := err.(net.Error)
+			if !ok {
+				return 0, nil, 0, err
+			}
+			if e.Timeout() {
+				return 0, nil, 0, c.WriteClose(Policy, "idle timout")
+			}
+			if !e.Temporary() {
+				return 0, nil, 0, err
+			}
+
+			time.Sleep(100 * time.Microsecond)
+			_, err = c.Read(nil)
+		}
+
+		opcode, final := c.ReadMode()
+
+		if opcode&ctrlFlag != 0 {
+			// TODO: retries + optimise flush with c.readBuf
+			var buf [125]byte
+			_, err := c.read(buf[:])
+			if err != nil {
+				return 0, nil, 0, err
+			}
+
+			// react
+			switch opcode {
+			case Ping:
+				go func() {
+					c.writeMutex.Lock()
+					c.Conn.Write(pongFrame)
+					c.writeMutex.Unlock()
+				}()
+			}
+
+			c.SetReadDeadline(time.Now().Add(idleTimeout))
+			continue
+		}
+
+		if final {
+			return opcode, readEOF{}, 0, nil
+		}
+
+		size := -1
+		if c.readHead&finalFlag != 0 {
+			size = c.readPayloadN
+		}
+
+		r := &messageReader{
+			conn:        c,
+			wireTimeout: wireTimeout,
+			idleTimeout: idleTimeout,
+		}
+		return opcode, r, size, nil
+	}
+}
+
+type messageReader struct {
+	conn        *Conn
+	wireTimeout time.Duration
+	idleTimeout time.Duration // TODO: deadline?
+	err         error
+}
+
+func (r *messageReader) Read(p []byte) (n int, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	r.conn.SetReadDeadline(time.Now().Add(r.wireTimeout))
+	n, err = r.conn.read(p)
+	for err != nil {
+		e, ok := err.(net.Error)
+		if !ok {
+			r.err = err
+			return
+		}
+		if e.Timeout() {
+			err = r.conn.WriteClose(Policy, "read timout")
+			r.err = err
+			return
+		}
+		if !e.Temporary() {
+			r.err = err
+			return
+		}
+
+		time.Sleep(100 * time.Microsecond)
+		var more int
+		more, err = r.conn.read(p[n:])
+		n += more
+	}
+
+	if _, final := r.conn.ReadMode(); final {
+		err = io.EOF
+		r.err = err
+	}
+	return
+}
+
+// Send is a high-level abstraction (from Write) for safety and convenience.
+// WireTimeout is the maximum submission time.
+func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) error {
+	c.SetWriteMode(opcode, true)
+
+	c.SetWriteDeadline(time.Now().Add(wireTimeout))
+	n, err := c.Write(message)
+	for err != nil {
+		e, ok := err.(net.Error)
+		if !ok {
+			return err
+		}
+		if e.Timeout() {
+			return c.WriteClose(Policy, "write timout")
+		}
+		if !e.Temporary() {
+			return err
+		}
+
+		time.Sleep(100 * time.Microsecond)
+		var more int
+		more, err = c.Write(message[n:])
+		n += more
+	}
+	return err
+}
+
+// Send is a high-level abstraction (from Write) for safety and convenience.
+// WireTimeout is the maximum submission time for each frame [Write or Close].
+func (c *Conn) SendStream(opcode uint, wireTimeout time.Duration) io.WriteCloser {
+	c.SetWriteMode(opcode, false)
+	return &messageWriter{conn: c, wireTimeout: wireTimeout}
+}
+
+type messageWriter struct {
+	conn        *Conn
+	wireTimeout time.Duration
+	closed      bool
+}
+
+func (w *messageWriter) Write(p []byte) (n int, err error) {
+	if w.closed {
+		return 0, io.ErrClosedPipe
+	}
+
+	w.conn.SetWriteDeadline(time.Now().Add(w.wireTimeout))
+	n, err = w.conn.Write(p)
+	for err != nil {
+		e, ok := err.(net.Error)
+		if !ok {
+			return
+		}
+		if e.Timeout() {
+			err = w.conn.WriteClose(Policy, "write timout")
+			return
+		}
+		if !e.Temporary() {
+			return
+		}
+
+		time.Sleep(100 * time.Microsecond)
+		var more int
+		more, err = w.conn.Write(p[n:])
+		n += more
+	}
+
+	return
+}
+
+func (w messageWriter) Close() error {
+	if w.closed {
+		return nil
+	}
+
+	head := w.conn.writeHead
+	if head&opcodeMask != Continuation {
+		// nothing written yet
+		w.closed = true
+		return nil
+	}
+
+	w.conn.writeHead = head | finalFlag
+	_, err := w.Write(nil)
+	if err != nil {
+		return err
+	}
+	w.closed = true
+	return nil
+}
+
+type readEOF struct{}
+
+func (r readEOF) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
