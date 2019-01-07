@@ -138,20 +138,9 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 
 		// deal with conrol frames
 		if opcode&ctrlFlag != 0 {
-			// received in buffer; flush payload
-			c.readBufDone += c.readPayloadN
-			c.readPayloadN = 0
-
-			// react
-			switch opcode {
-			case Ping:
-				go func() {
-					c.writeMutex.Lock()
-					c.Conn.Write(pongFrame)
-					c.writeMutex.Unlock()
-				}()
+			if err := c.gotCtrl(opcode); err != nil {
+				return 0, 0, err
 			}
-
 			continue
 		}
 
@@ -215,20 +204,9 @@ func (c *Conn) ReceiveStream(wireTimeout, idleTimeout time.Duration) (opcode uin
 
 		// deal with conrol frames
 		if opcode&ctrlFlag != 0 {
-			// received in buffer; flush payload
-			c.readBufDone += c.readPayloadN
-			c.readPayloadN = 0
-
-			// react
-			switch opcode {
-			case Ping:
-				go func() {
-					c.writeMutex.Lock()
-					c.Conn.Write(pongFrame)
-					c.writeMutex.Unlock()
-				}()
+			if err := c.gotCtrl(opcode); err != nil {
+				return 0, nil, err
 			}
-
 			continue
 		}
 
@@ -292,7 +270,7 @@ func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) erro
 	for err != nil {
 		e, ok := err.(net.Error)
 		if ok && e.Timeout() {
-			c.WriteClose(Policy, "write timeout")
+			c.setClose(Policy, "write timeout")
 		}
 		if !ok || !e.Temporary() {
 			return err
@@ -331,7 +309,7 @@ func (w *messageWriter) Write(p []byte) (n int, err error) {
 	for err != nil {
 		e, ok := err.(net.Error)
 		if ok && e.Timeout() {
-			w.conn.WriteClose(Policy, "write timeout")
+			w.conn.setClose(Policy, "write timeout")
 		}
 		if !ok || !e.Temporary() {
 			return
@@ -371,4 +349,40 @@ type readEOF struct{}
 
 func (r readEOF) Read([]byte) (int, error) {
 	return 0, io.EOF
+}
+
+// GotCtrl deals with the controll frame in the read buffer.
+func (c *Conn) gotCtrl(opcode uint) error {
+	switch opcode {
+	case Ping:
+		// reuse read buffer for pong frame
+		c.readBuf[c.readBufDone-2] = Pong | finalFlag
+		c.readBuf[c.readBufDone-1] = byte(c.readPayloadN)
+		pongFrame := c.readBuf[c.readBufDone-2 : c.readBufDone+c.readPayloadN]
+
+		c.writeMutex.Lock()
+		defer c.writeMutex.Unlock()
+		n, err := c.Conn.Write(pongFrame)
+		for err != nil {
+			e, ok := err.(net.Error)
+			if ok && e.Timeout() {
+				c.setClose(Policy, "write timeout")
+				return err
+			}
+			if !ok || !e.Temporary() {
+				return err
+			}
+
+			time.Sleep(100 * time.Microsecond)
+			var more int
+			more, err = c.Conn.Write(pongFrame[n:])
+			n += more
+		}
+	}
+
+	// flush payload
+	c.readBufDone += c.readPayloadN
+	c.readPayloadN = 0
+
+	return nil
 }

@@ -24,6 +24,12 @@ const (
 	maskFlag = 0x80
 )
 
+const (
+	// distinguish between the zero value
+	statusCodeSetFlag = 0x10000
+	statusCodeMask    = 0xffff
+)
+
 // ErrRetry rejects a write. See method documentation!
 var errRetry = errors.New("websocket: retry after error with differend payload size")
 
@@ -77,50 +83,50 @@ type Conn struct {
 	writeBuf [127]byte
 }
 
-// WriteClose sends a Close frame with best-effort. Operation does not block and
-// the return is always a CloseError. When the connectection already received or
-// send a Close then only the first status code remains in effect. The redundant
-// status codes are discarded, including any corresponding Close notifications.
+func (c *Conn) setClose(statusCode uint, reason string) bool {
+	return atomic.CompareAndSwapUint32(&c.statusCode, 0, uint32(statusCode|statusCodeSetFlag))
+}
+
+// WriteClose sends a Close frame with best-effort. The return is a CloseError.
+// When the connectection already received or send a Close then only the first
+// status code remains in effect. The redundant status codes are discarded,
+// including any corresponding Close notifications.
 // Conn.Close must still be called, even after WriteClose.
 func (c *Conn) WriteClose(statusCode uint, reason string) error {
-	if !atomic.CompareAndSwapUint32(&c.statusCode, 0, uint32(statusCode)) {
+	if !atomic.CompareAndSwapUint32(&c.statusCode, 0, uint32(statusCode|statusCodeSetFlag)) {
 		// already closed
 		return c.closeError()
 	}
 
-	// The payload of control frames is limited to 125 bytes
-	// and the status code takes 2.
+	// control frame payload limit is 125 bytes; status code takes 2
 	if len(reason) > 123 {
 		reason = reason[:123]
 	}
 
-	go func() {
-		c.writeMutex.Lock()
-		defer c.writeMutex.Unlock()
+	c.writeMutex.Lock()
+	// best effort close notification; no pending errors
+	if c.writeBufN == 0 && c.writePayloadN == 0 {
+		c.writeBuf[0] = Close & finalFlag
+		if statusCode == NoStatusCode {
+			c.writeBuf[1] = 0
+			c.Conn.Write(c.writeBuf[:2])
+		} else {
+			c.writeBuf[1] = byte(len(reason) + 2)
+			c.writeBuf[2] = byte(statusCode >> 8)
+			c.writeBuf[3] = byte(statusCode)
+			copy(c.writeBuf[4:], reason)
+			c.Conn.Write(c.writeBuf[:4+len(reason)])
+		}
+	}
+	c.writeMutex.Unlock()
 
-		// best effort close notification; no pending errors
-		if c.writeBufN <= 0 && c.writePayloadN <= 0 {
-			c.writeBuf[0] = Close & finalFlag
-			if statusCode == NoStatusCode {
-				c.writeBuf[1] = 0
-				c.Conn.Write(c.writeBuf[:2])
-			} else {
-				c.writeBuf[1] = byte(len(reason) + 2)
-				c.writeBuf[2] = byte(statusCode >> 8)
-				c.writeBuf[3] = byte(statusCode)
-				copy(c.writeBuf[4:], reason)
-				c.Conn.Write(c.writeBuf[:4+len(reason)])
-			}
-		}
-
-		// Both *tls.Conn and *net.TCPConn offer CloseWrite.
-		type CloseWriter interface {
-			CloseWrite() error
-		}
-		if cc, ok := c.Conn.(CloseWriter); ok {
-			cc.CloseWrite()
-		}
-	}()
+	// Both *tls.Conn and *net.TCPConn offer CloseWrite.
+	type CloseWriter interface {
+		CloseWrite() error
+	}
+	if cc, ok := c.Conn.(CloseWriter); ok {
+		cc.CloseWrite()
+	}
 
 	return ClosedError(statusCode)
 }
@@ -129,7 +135,7 @@ func (c *Conn) WriteClose(statusCode uint, reason string) error {
 func (c *Conn) closeError() error {
 	statusCode := atomic.LoadUint32(&c.statusCode)
 	if statusCode != 0 {
-		return ClosedError(statusCode)
+		return ClosedError(statusCode & statusCodeMask)
 	}
 	return nil
 }
