@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"time"
+	"unicode/utf8"
 )
 
 // Opcode defines the interpretation of a frame payload.
@@ -73,6 +74,9 @@ const (
 	Unexpected = 1011
 )
 
+// ErrUTF8 signals malformed text.
+var ErrUTF8 = errors.New("websocket: invalid UTF-8 sequence")
+
 // ClosedError is a status code. Atomic Close support prevents Go issue 4373.
 // Even after receiving a ClosedError, Conn.Close must still be called.
 type ClosedError uint
@@ -133,6 +137,11 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 			return opcode, n, err
 		}
 	}
+
+	if opcode == Text && !utf8.Valid(buf[:n]) {
+		return opcode, n, ErrUTF8
+	}
+
 	return opcode, n, nil
 }
 
@@ -152,13 +161,21 @@ func (c *Conn) ReceiveStream(wireTimeout, idleTimeout time.Duration) (opcode uin
 		return 0, nil, err
 	}
 
-	if final {
-		return opcode, readEOF{}, nil
+	switch {
+	case final:
+		r = readEOF{}
+	case opcode == Text:
+		r = &textReader{
+			conn:        c,
+			wireTimeout: wireTimeout,
+		}
+	default:
+		r = &messageReader{
+			conn:        c,
+			wireTimeout: wireTimeout,
+		}
 	}
-	return opcode, &messageReader{
-		conn:        c,
-		wireTimeout: wireTimeout,
-	}, nil
+	return opcode, r, nil
 }
 
 type messageReader struct {
@@ -179,6 +196,64 @@ func (r *messageReader) Read(p []byte) (n int, err error) {
 			err = io.EOF
 		}
 	}
+	return n, err
+}
+
+type textReader struct {
+	conn        *Conn
+	wireTimeout time.Duration
+	err         error
+	tail        [utf8.UTFMax - 1]byte
+	tailN       int
+}
+
+func (r *textReader) Read(p []byte) (n int, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	// start with remainder
+	n = r.tailN
+	for i := range p {
+		if i >= n {
+			break
+		}
+		p[i] = r.tail[i]
+	}
+
+	// actual read
+	more, _, final, err := r.conn.readWithRetry(p[n:], r.wireTimeout)
+	n += more
+
+	// validation overrules I/O errors; received payload shoud be valid
+	if !utf8.Valid(p[:n]) {
+		if final {
+			return n, ErrUTF8
+		}
+		// last rune might be partial
+
+		end := n
+		for end--; end >= 0; end-- {
+			if p[end]&0xc0 != 0xc0 {
+				break // multi-byte start
+			}
+		}
+
+		if end+utf8.UTFMax >= n || !utf8.Valid(p[:end]) {
+			return n, ErrUTF8
+		}
+
+		r.tailN = copy(r.tail[:], p[end:])
+		n = end
+	}
+
+	if final {
+		r.err = io.EOF
+		if err == nil {
+			err = io.EOF
+		}
+	}
+
 	return n, err
 }
 

@@ -43,7 +43,8 @@ const AcceptV13 = 1<<Continuation | 1<<Text | 1<<Binary | 1<<Close | 1<<Ping | 1
 // any Close frame occurrence. Multiple goroutines may invoke net.Conn methods
 // simultaneously.
 //
-// Conn also offers high-level abstraction with the Receive and Send methods.
+// Conn also offers high-level abstraction with the Receive and Send methods,
+// including ErrUTF8 protection.
 //
 // Connections must be read consecutively for correct operation and closure.
 type Conn struct {
@@ -187,8 +188,6 @@ func (c *Conn) write(p []byte) (n int, err error) {
 		return 0, err
 	}
 
-	// BUG(pascaldekloe): UTF-8 submission is not validated.
-
 	// pending state/frame
 	if c.writeBufN > 0 || c.writePayloadN > 0 {
 		// inconsistent payload length breaks frame
@@ -308,7 +307,6 @@ func (c *Conn) read(p []byte) (n int, err error) {
 
 	// deal with payload
 	c.unmaskN(p[:n])
-	// BUG(pascaldekloe): Broken UTF-8 receival is not rejected with Malformed.
 
 	if err == io.EOF {
 		if c.readPayloadN != 0 {
