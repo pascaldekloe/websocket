@@ -36,10 +36,7 @@ var GoldenFrames = []struct {
 
 func TestWrite(t *testing.T) {
 	for _, gold := range GoldenFrames {
-		// create a connection with an endpoint
-		testConn, testEnd := net.Pipe()
-		// timeout protection (against hanging tests)
-		time.AfterFunc(time.Second, func() { testConn.Close() })
+		conn, testEnd := pipeConn()
 
 		// collect from test end
 		done := make(chan *bytes.Buffer)
@@ -53,9 +50,8 @@ func TestWrite(t *testing.T) {
 		}()
 
 		// sumbit message
-		ws := Conn{Conn: testConn}
-		ws.SetWriteMode(gold.Opcode, true)
-		n, err := ws.Write([]byte(gold.Message))
+		conn.SetWriteMode(gold.Opcode, true)
+		n, err := conn.Write([]byte(gold.Message))
 		if err != nil {
 			t.Errorf("%#x: connection write error: %s", gold.Frame, err)
 		}
@@ -64,7 +60,7 @@ func TestWrite(t *testing.T) {
 		}
 
 		// close connection to EOF test end
-		if err := ws.Close(); err != nil {
+		if err := conn.Close(); err != nil {
 			t.Errorf("%#x: connection close error: %s", gold.Frame, err)
 		}
 
@@ -77,10 +73,7 @@ func TestWrite(t *testing.T) {
 
 func TestRead(t *testing.T) {
 	for _, gold := range GoldenFrames {
-		// create a connection with an endpoint
-		testConn, testEnd := net.Pipe()
-		// timeout protection (against hanging tests)
-		time.AfterFunc(time.Second, func() { testConn.Close() })
+		conn, testEnd := pipeConn()
 
 		// submit from test end
 		done := make(chan struct{})
@@ -99,18 +92,17 @@ func TestRead(t *testing.T) {
 		}()
 
 		// collect message
-		c := &Conn{Conn: testConn}
 		var got []byte
 		for readCount := 1; ; readCount++ {
 			buf := make([]byte, 1024)
-			n, err := c.Read(buf)
+			n, err := conn.Read(buf)
 			if err != nil {
 				t.Errorf("%#x: connection read %d error: %s", gold.Masked, readCount, err)
 				break
 			}
 			got = append(got, buf[:n]...)
 
-			opcode, final := c.ReadMode()
+			opcode, final := conn.ReadMode()
 			if opcode != gold.Opcode {
 				t.Errorf("%#x: connection read %d got opcode %d, want %d", gold.Masked, readCount, opcode, gold.Opcode)
 			}
@@ -147,10 +139,7 @@ var GoldenFragments = []struct {
 
 func TestFragment(t *testing.T) {
 	for goldIndex, gold := range GoldenFragments {
-		// create a connection with an endpoint
-		testConn, testEnd := net.Pipe()
-		// timeout protection (against hanging tests)
-		time.AfterFunc(time.Second, func() { testConn.Close() })
+		conn, testEnd := pipeConn()
 
 		var wg sync.WaitGroup
 
@@ -174,11 +163,10 @@ func TestFragment(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			c := &Conn{Conn: testConn}
 			for _, want := range gold.Messages {
 				// read
 				var buf [1024]byte
-				n, err := c.Read(buf[:])
+				n, err := conn.Read(buf[:])
 				if err != nil {
 					t.Errorf("%d: connection read error: %s", goldIndex, err)
 					return
@@ -192,9 +180,9 @@ func TestFragment(t *testing.T) {
 				}
 
 				// echo
-				opcode, final := c.ReadMode()
-				c.SetWriteMode(opcode, final)
-				if _, err = c.Write(buf[:n]); err != nil {
+				opcode, final := conn.ReadMode()
+				conn.SetWriteMode(opcode, final)
+				if _, err = conn.Write(buf[:n]); err != nil {
 					t.Errorf("%d: connection write error: %s", goldIndex, err)
 					return
 				}
@@ -226,4 +214,14 @@ func TestConnInterface(t *testing.T) {
 	if _, ok := interface{}(new(Conn)).(net.Conn); !ok {
 		t.Error("Conn does not implement net.Conn")
 	}
+}
+
+// PipeConn returns a connection with a test endpoint.
+func pipeConn() (*Conn, net.Conn) {
+	testConn, testEnd := net.Pipe()
+
+	// timeout protection (against hanging tests)
+	time.AfterFunc(time.Second, func() { testConn.Close() })
+
+	return &Conn{Conn: testConn}, testEnd
 }

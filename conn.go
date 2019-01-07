@@ -48,11 +48,6 @@ const AcceptV13 = 1<<Continuation | 1<<Text | 1<<Binary | 1<<Close | 1<<Ping | 1
 // Connections must be read consecutively for correct operation and closure.
 type Conn struct {
 	net.Conn
-	// read & write lock
-	readMutex, writeMutex sync.Mutex
-
-	// pending number of bytes
-	readPayloadN, writePayloadN int
 
 	// When not zero, then receival of opcodes without a flag are rejected
 	// with a connection Close, status code 1003—CannotAccept. Flags follow
@@ -60,10 +55,18 @@ type Conn struct {
 	// all reserved opcodes.
 	Accept uint
 
+	// read & write lock
+	readMutex, writeMutex sync.Mutex
+
+	// pending number of bytes
+	readPayloadN, writePayloadN int
+
 	// first byte of last frame read
 	readHead uint32
 	// first byte of next frame written
 	writeHead uint32
+
+	readFragmentation bool
 
 	// read mask byte position
 	maskI uint
@@ -318,6 +321,12 @@ func (c *Conn) read(p []byte) (n int, err error) {
 }
 
 func (c *Conn) nextFrame() error {
+	if c.readBufDone != 0 {
+		// move read ahead to beginning of buffer
+		c.readBufN = copy(c.readBuf[:], c.readBuf[c.readBufDone:c.readBufN])
+		c.readBufDone = 0
+	}
+
 	if err := c.ensureBufN(6); err != nil {
 		// TODO: check mask missing?
 		return err
@@ -325,23 +334,20 @@ func (c *Conn) nextFrame() error {
 
 	// get frame header
 	head := uint(c.readBuf[0])
-
-	// Conn.readHead marker to distinguish between the zero value
-	const headSetFlag = 1 << 8
-	lastHead := uint(atomic.LoadUint32(&c.readHead))
-	atomic.StoreUint32(&c.readHead, uint32(head|headSetFlag))
+	atomic.StoreUint32(&c.readHead, uint32(head))
 
 	// sequence validation
-	if lastHead&headSetFlag != 0 {
-		if lastHead&finalFlag == 0 {
-			if head&opcodeMask != Continuation && head&ctrlFlag == 0 {
-				return c.WriteClose(ProtocolError, "fragmented message interrupted")
-			}
-		} else {
-			if head&opcodeMask == Continuation {
-				return c.WriteClose(ProtocolError, "continuation of final message")
-			}
+	if c.readFragmentation {
+		if head&opcodeMask != Continuation && head&ctrlFlag == 0 {
+			return c.WriteClose(ProtocolError, "fragmented message interrupted")
 		}
+	} else {
+		if head&opcodeMask == Continuation {
+			return c.WriteClose(ProtocolError, "continuation of final message")
+		}
+	}
+	if head&ctrlFlag == 0 {
+		c.readFragmentation = head&finalFlag == 0
 	}
 
 	if head&reservedMask != 0 {
@@ -411,6 +417,7 @@ func (c *Conn) nextFrame() error {
 	c.mask = maskOrder.Uint32(c.readBuf[2:6])
 	c.maskI = 0
 	c.readBufDone = 6
+
 	c.unmaskN(c.readBuf[6 : 6+c.readPayloadN])
 
 	if head&opcodeMask == Close {
@@ -426,10 +433,6 @@ func (c *Conn) nextFrame() error {
 // EnsureBufN reads until buf has at least n bytes.
 // Any remaining data is moved to the beginning of the buffer.
 func (c *Conn) ensureBufN(n int) error {
-	if c.readBufDone != 0 {
-		c.readBufN = copy(c.readBuf[:], c.readBuf[c.readBufDone:c.readBufN])
-		c.readBufDone = 0
-	}
 	for c.readBufN < n {
 		done, err := c.Conn.Read(c.readBuf[c.readBufN:])
 		c.readBufN += done

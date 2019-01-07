@@ -116,38 +116,24 @@ var ErrOverflow = errors.New("websocket: message exceeds buffer size")
 // WireTimeout is the limit for Read [frame receival] and idleTimeout limits
 // the amount of time to wait for arrival.
 func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opcode uint, n int, err error) {
-	for {
-		_, err = c.readWithRetry(nil, idleTimeout)
-		if err != nil {
-			return 0, 0, err
-		}
-
-		opcode, final := c.ReadMode()
-
-		// deal with conrol frames
-		if opcode&ctrlFlag != 0 {
-			if err := c.gotCtrl(opcode); err != nil {
-				return 0, 0, err
-			}
-			continue
-		}
-
-		for !final {
-			if n >= len(buf) {
-				return opcode, n, ErrOverflow
-			}
-
-			more, err := c.readWithRetry(buf[n:], wireTimeout)
-			n += more
-			if err != nil {
-				return 0, 0, err
-			}
-
-			_, final = c.ReadMode()
-		}
-
-		return opcode, n, nil
+	n, opcode, final, err := c.readWithRetry(buf, idleTimeout)
+	if err != nil {
+		return opcode, 0, err
 	}
+
+	for !final {
+		if n >= len(buf) {
+			return opcode, n, ErrOverflow
+		}
+
+		var more int
+		more, _, final, err = c.readWithRetry(buf[n:], wireTimeout)
+		n += more
+		if err != nil {
+			return opcode, n, err
+		}
+	}
+	return opcode, n, nil
 }
 
 // ReceiveStream is a high-level abstraction (from Read) for safety and
@@ -161,30 +147,18 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 // WireTimeout is the limit for Read [frame receival] and idleTimeout limits
 // the amount of time to wait for arrival.
 func (c *Conn) ReceiveStream(wireTimeout, idleTimeout time.Duration) (opcode uint, r io.Reader, err error) {
-	for {
-		_, err = c.readWithRetry(nil, idleTimeout)
-		if err != nil {
-			return 0, nil, err
-		}
-
-		opcode, final := c.ReadMode()
-
-		// deal with conrol frames
-		if opcode&ctrlFlag != 0 {
-			if err := c.gotCtrl(opcode); err != nil {
-				return 0, nil, err
-			}
-			continue
-		}
-
-		if final {
-			return opcode, readEOF{}, nil
-		}
-		return opcode, &messageReader{
-			conn:        c,
-			wireTimeout: wireTimeout,
-		}, nil
+	_, opcode, final, err := c.readWithRetry(nil, idleTimeout)
+	if err != nil {
+		return 0, nil, err
 	}
+
+	if final {
+		return opcode, readEOF{}, nil
+	}
+	return opcode, &messageReader{
+		conn:        c,
+		wireTimeout: wireTimeout,
+	}, nil
 }
 
 type messageReader struct {
@@ -198,15 +172,14 @@ func (r *messageReader) Read(p []byte) (n int, err error) {
 		return 0, r.err
 	}
 
-	n, err = r.conn.readWithRetry(p, r.wireTimeout)
-
-	if _, final := r.conn.ReadMode(); final {
+	n, _, final, err := r.conn.readWithRetry(p, r.wireTimeout)
+	if final {
 		r.err = io.EOF
 		if err == nil {
 			err = io.EOF
 		}
 	}
-	return
+	return n, err
 }
 
 // Send is a high-level abstraction (from Write) for safety and convenience.
@@ -264,32 +237,42 @@ func (r readEOF) Read([]byte) (int, error) {
 	return 0, io.EOF
 }
 
-func (c *Conn) readWithRetry(p []byte, timeout time.Duration) (n int, err error) {
+func (c *Conn) readWithRetry(p []byte, timeout time.Duration) (n int, opcode uint, final bool, err error) {
 	var retryDelay time.Duration = time.Microsecond
 
-	c.SetReadDeadline(time.Now().Add(timeout))
-	n, err = c.Read(p)
-	for err != nil {
-		e, ok := err.(net.Error)
-		if ok && e.Timeout() {
-			c.WriteClose(Policy, "read timeout")
-			return
+	for {
+		c.SetReadDeadline(time.Now().Add(timeout))
+		n, err = c.Read(p)
+		for err != nil {
+			e, ok := err.(net.Error)
+			if ok && e.Timeout() {
+				c.WriteClose(Policy, "read timeout")
+				return
+			}
+			if !ok || !e.Temporary() {
+				return
+			}
+
+			time.Sleep(retryDelay)
+			if retryDelay < time.Second {
+				retryDelay *= 2
+			}
+
+			var more int
+			more, err = c.Read(p)
+			n += more
 		}
-		if !ok || !e.Temporary() {
+
+		opcode, final = c.ReadMode()
+		if opcode&ctrlFlag == 0 {
 			return
 		}
 
-		time.Sleep(retryDelay)
-		if retryDelay < time.Second {
-			retryDelay *= 2
+		err = c.gotCtrl(opcode)
+		if err != nil {
+			return
 		}
-
-		var more int
-		more, err = c.Read(p)
-		n += more
 	}
-
-	return
 }
 
 func (c *Conn) writeWithRetry(p []byte, timeout time.Duration) (n int, err error) {
