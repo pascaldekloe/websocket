@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 )
 
 // first (frame) byte layout
@@ -106,15 +107,19 @@ func (c *Conn) WriteClose(statusCode uint, reason string) error {
 	if len(reason) > 123 {
 		reason = reason[:123]
 	}
+	if !utf8.ValidString(reason) {
+		reason = ""
+	}
 
 	c.writeMutex.Lock()
 	// best effort close notification; no pending errors
 	if c.writeBufN == 0 && c.writePayloadN == 0 {
 		c.writeBuf[0] = Close | finalFlag
-		if statusCode == NoStatusCode {
+		switch statusCode {
+		case NoStatusCode, AbnormalClose, 1015:
 			c.writeBuf[1] = 0
 			c.Conn.Write(c.writeBuf[:2])
-		} else {
+		default:
 			c.writeBuf[1] = byte(len(reason) + 2)
 			c.writeBuf[2] = byte(statusCode >> 8)
 			c.writeBuf[3] = byte(statusCode)
