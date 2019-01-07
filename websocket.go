@@ -127,6 +127,7 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 
 	for !final {
 		if n >= len(buf) {
+			c.WriteClose(TooBig, "")
 			return opcode, n, ErrOverflow
 		}
 
