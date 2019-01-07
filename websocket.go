@@ -102,8 +102,6 @@ func (e ClosedError) Timeout() bool { return false }
 // Temporary honors the net.Error interface.
 func (e ClosedError) Temporary() bool { return false }
 
-var pongFrame = []byte{Pong | finalFlag, 0}
-
 // ErrOverflow signals an incomming message larger than the provided buffer.
 var ErrOverflow = errors.New("websocket: message exceeds buffer size")
 
@@ -125,6 +123,7 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 			e, ok := err.(net.Error)
 			if ok && e.Timeout() {
 				c.WriteClose(Policy, "idle timeout")
+				return 0, 0, err
 			}
 			if !ok || !e.Temporary() {
 				return 0, 0, err
@@ -157,6 +156,7 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 				e, ok := err.(net.Error)
 				if ok && e.Timeout() {
 					c.WriteClose(Policy, "read timeout")
+					return 0, 0, err
 				}
 				if !ok || !e.Temporary() {
 					return 0, 0, err
@@ -191,6 +191,7 @@ func (c *Conn) ReceiveStream(wireTimeout, idleTimeout time.Duration) (opcode uin
 			e, ok := err.(net.Error)
 			if ok && e.Timeout() {
 				c.WriteClose(Policy, "idle timeout")
+				return 0, nil, err
 			}
 			if !ok || !e.Temporary() {
 				return 0, nil, err
@@ -216,7 +217,6 @@ func (c *Conn) ReceiveStream(wireTimeout, idleTimeout time.Duration) (opcode uin
 		return opcode, &messageReader{
 			conn:        c,
 			wireTimeout: wireTimeout,
-			idleTimeout: idleTimeout,
 		}, nil
 	}
 }
@@ -224,7 +224,6 @@ func (c *Conn) ReceiveStream(wireTimeout, idleTimeout time.Duration) (opcode uin
 type messageReader struct {
 	conn        *Conn
 	wireTimeout time.Duration
-	idleTimeout time.Duration // TODO: deadline?
 	err         error
 }
 
@@ -239,6 +238,8 @@ func (r *messageReader) Read(p []byte) (n int, err error) {
 		e, ok := err.(net.Error)
 		if ok && e.Timeout() {
 			r.conn.WriteClose(Policy, "read timeout")
+			r.err = err
+			return
 		}
 		if !ok || !e.Temporary() {
 			r.err = err
@@ -252,8 +253,10 @@ func (r *messageReader) Read(p []byte) (n int, err error) {
 	}
 
 	if _, final := r.conn.ReadMode(); final {
-		err = io.EOF
-		r.err = err
+		r.err = io.EOF
+		if err == nil {
+			err = io.EOF
+		}
 	}
 	return
 }
@@ -329,14 +332,8 @@ func (w messageWriter) Close() error {
 		return nil
 	}
 
-	head := w.conn.writeHead
-	if head&opcodeMask != Continuation {
-		// nothing written yet
-		w.closed = true
-		return nil
-	}
+	w.conn.writeHead |= finalFlag
 
-	w.conn.writeHead = head | finalFlag
 	_, err := w.Write(nil)
 	if err != nil {
 		return err

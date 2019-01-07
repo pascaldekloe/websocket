@@ -106,7 +106,7 @@ func (c *Conn) WriteClose(statusCode uint, reason string) error {
 	c.writeMutex.Lock()
 	// best effort close notification; no pending errors
 	if c.writeBufN == 0 && c.writePayloadN == 0 {
-		c.writeBuf[0] = Close & finalFlag
+		c.writeBuf[0] = Close | finalFlag
 		if statusCode == NoStatusCode {
 			c.writeBuf[1] = 0
 			c.Conn.Write(c.writeBuf[:2])
@@ -119,14 +119,6 @@ func (c *Conn) WriteClose(statusCode uint, reason string) error {
 		}
 	}
 	c.writeMutex.Unlock()
-
-	// Both *tls.Conn and *net.TCPConn offer CloseWrite.
-	type CloseWriter interface {
-		CloseWrite() error
-	}
-	if cc, ok := c.Conn.(CloseWriter); ok {
-		cc.CloseWrite()
-	}
 
 	return ClosedError(statusCode)
 }
@@ -425,7 +417,7 @@ func (c *Conn) nextFrame() error {
 		if c.readPayloadN < 2 {
 			return c.WriteClose(NoStatusCode, "")
 		}
-		return c.WriteClose(uint(binary.BigEndian.Uint16(c.readBuf[6:8])), string(c.readBuf[8:c.readBufN]))
+		return c.WriteClose(uint(binary.BigEndian.Uint16(c.readBuf[6:8])), string(c.readBuf[8:6+c.readPayloadN]))
 	}
 
 	return nil
