@@ -268,7 +268,7 @@ func (c *Conn) readWithRetry(p []byte, timeout time.Duration) (n int, opcode uin
 			return
 		}
 
-		err = c.gotCtrl(opcode)
+		err = c.gotCtrl(opcode, n)
 		if err != nil {
 			return
 		}
@@ -303,13 +303,13 @@ func (c *Conn) writeWithRetry(p []byte, timeout time.Duration) (n int, err error
 }
 
 // GotCtrl deals with the controll frame in the read buffer.
-func (c *Conn) gotCtrl(opcode uint) error {
+func (c *Conn) gotCtrl(opcode uint, readN int) error {
 	switch opcode {
 	case Ping:
 		// reuse read buffer for pong frame
-		c.readBuf[c.readBufDone-2] = Pong | finalFlag
-		c.readBuf[c.readBufDone-1] = byte(c.readPayloadN)
-		pongFrame := c.readBuf[c.readBufDone-2 : c.readBufDone+c.readPayloadN]
+		c.readBuf[4] = Pong | finalFlag
+		c.readBuf[5] = byte(readN + c.readPayloadN)
+		pongFrame := c.readBuf[4 : 6+readN+c.readPayloadN]
 
 		c.writeMutex.Lock()
 		defer c.writeMutex.Unlock()

@@ -34,10 +34,10 @@ func TestReceiveCtrlInteruption(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		var got bytes.Buffer
-		got.ReadFrom(testEnd)
-		if got.Len() != 0 {
-			t.Errorf("test end received %q", got.String())
+		var buf bytes.Buffer
+		buf.ReadFrom(testEnd)
+		if got, want := buf.String(), "\x8a\x01."; got != want {
+			t.Errorf("test end received %q, want %q", got, want)
 		}
 	}()
 
@@ -47,7 +47,7 @@ func TestReceiveCtrlInteruption(t *testing.T) {
 
 		_, err := io.WriteString(testEnd,
 			"\x01\x85\x00\x00\x00\x00Hello"+
-				"\x8a\x81\x00\x00\x00\x00."+
+				"\x89\x81\x00\x00\x00\x00."+
 				"\x80\x86\x00\x00\x00\x00 World")
 		if err != nil {
 			t.Error("test end write error:", err)
@@ -66,5 +66,8 @@ func TestReceiveCtrlInteruption(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 
+	if err := conn.Close(); err != nil {
+		t.Error("connection close error:", err)
+	}
 	wg.Wait()
 }
