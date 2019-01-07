@@ -363,13 +363,19 @@ func (c *Conn) nextFrame() error {
 		return c.WriteClose(ProtocolError, "no mask")
 	}
 
+	if c.Accept != 0 && c.Accept&1<<(head&opcodeMask) == 0 {
+		var raeson string
+		opcode := head & opcodeMask
+		if opcode < 10 {
+			raeson = "opcode " + string('0'+opcode)
+		} else {
+			raeson = "opcode 1" + string('0'+opcode/10)
+		}
+		return c.WriteClose(CannotAccept, raeson)
+	}
+
 	if head&ctrlFlag == 0 {
 		// non-control frame
-
-		if c.Accept != 0 && c.Accept&1<<(head&opcodeMask) == 0 {
-			return c.WriteClose(CannotAccept, "opcode "+string('0'+head&opcodeMask))
-		}
-
 		switch c.readPayloadN {
 		default:
 			c.mask = maskOrder.Uint32(c.readBuf[2:6])
