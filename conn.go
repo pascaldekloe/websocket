@@ -364,7 +364,7 @@ func (c *Conn) nextFrame() error {
 		return c.WriteClose(ProtocolError, "no mask")
 	}
 
-	if c.Accept != 0 && c.Accept&1<<(head&opcodeMask) == 0 {
+	if c.Accept != 0 && c.Accept&(1<<(head&opcodeMask)) == 0 {
 		var raeson string
 		opcode := head & opcodeMask
 		if opcode < 10 {
