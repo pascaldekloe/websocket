@@ -15,12 +15,17 @@ func BenchmarkReceive(b *testing.B) {
 
 	// concatenate all golden frames
 	var frames []byte
+	var messageCount, messageSize int
 	for _, gold := range GoldenFrames {
 		frames = append(frames, gold.Masked...)
+		messageCount++
+		messageSize += len(gold.Message)
 	}
 	for _, gold := range GoldenFragments {
 		for _, s := range gold.Maskeds {
 			frames = append(frames, s...)
+			messageCount++
+			messageSize += len(s)
 		}
 	}
 
@@ -38,8 +43,11 @@ func BenchmarkReceive(b *testing.B) {
 	}()
 
 	b.Run("buffer", func(b *testing.B) {
+		b.SetBytes(int64(messageSize / messageCount))
+		b.ReportAllocs()
+
 		conn := dialListener(b, ln)
-		buf := make([]byte, 1024*1024)
+		buf := make([]byte, 100*1024)
 		for i := 0; i < b.N; i++ {
 			_, _, err := conn.Receive(buf, time.Millisecond, time.Millisecond)
 			if err != nil {
@@ -49,6 +57,9 @@ func BenchmarkReceive(b *testing.B) {
 	})
 
 	b.Run("stream", func(b *testing.B) {
+		b.SetBytes(int64(messageSize / messageCount))
+		b.ReportAllocs()
+
 		conn := dialListener(b, ln)
 		buf := make([]byte, 1024)
 		for i := 0; i < b.N; i++ {
@@ -68,16 +79,21 @@ func BenchmarkReceive(b *testing.B) {
 		}
 	})
 
-	b.Run("read", func(b *testing.B) {
-		conn := dialListener(b, ln)
-		buf := make([]byte, 1024*1024)
+	b.Run("tcp", func(b *testing.B) {
+		b.SetBytes(int64(messageSize / messageCount))
+		b.ReportAllocs()
+
+		conn := dialListener(b, ln).Conn
+		buf := make([]byte, 100*1024)
 		for i := 0; i < b.N; i++ {
 			conn.SetReadDeadline(time.Now().Add(time.Millisecond))
+			size := messageSize / messageCount
 			for {
-				if _, err := conn.Read(buf); err != nil {
+				n, err := conn.Read(buf[:size])
+				if err != nil {
 					b.Fatal(err)
 				}
-				if _, final := conn.ReadMode(); final {
+				if size -= n; size == 0 {
 					break
 				}
 			}
@@ -94,20 +110,25 @@ func BenchmarkSend(b *testing.B) {
 	// concatenate all golden messages
 	var messages [][]byte
 	var opcodes []uint
+	var messageCount, messageSize int
 	for _, gold := range GoldenFrames {
 		messages = append(messages, []byte(gold.Message))
 		opcodes = append(opcodes, gold.Opcode)
+		messageCount++
+		messageSize += len(gold.Message)
 	}
 	for _, gold := range GoldenFragments {
 		for _, s := range gold.Messages {
 			messages = append(messages, []byte(s))
 			opcodes = append(opcodes, gold.Opcode)
+			messageCount++
+			messageSize += len(s)
 		}
 	}
 
 	// drain testEnd
 	go func() {
-		buf := make([]byte, 1024*1024)
+		buf := make([]byte, 1024)
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -120,6 +141,9 @@ func BenchmarkSend(b *testing.B) {
 	}()
 
 	b.Run("buffer", func(b *testing.B) {
+		b.SetBytes(int64(messageSize / messageCount))
+		b.ReportAllocs()
+
 		conn := dialListener(b, ln)
 		for i := 0; i < b.N; i++ {
 			err := conn.Send(opcodes[i%len(opcodes)], messages[i%len(messages)], time.Millisecond)
@@ -130,6 +154,9 @@ func BenchmarkSend(b *testing.B) {
 	})
 
 	b.Run("stream", func(b *testing.B) {
+		b.SetBytes(int64(messageSize / messageCount))
+		b.ReportAllocs()
+
 		conn := dialListener(b, ln)
 		for i := 0; i < b.N; i++ {
 			w := conn.SendStream(opcodes[i%len(opcodes)], time.Millisecond)
@@ -143,10 +170,12 @@ func BenchmarkSend(b *testing.B) {
 		}
 	})
 
-	b.Run("write", func(b *testing.B) {
-		conn := dialListener(b, ln)
+	b.Run("tcp", func(b *testing.B) {
+		b.SetBytes(int64(messageSize / messageCount))
+		b.ReportAllocs()
+
+		conn := dialListener(b, ln).Conn
 		for i := 0; i < b.N; i++ {
-			conn.SetWriteMode(opcodes[i%len(opcodes)], true)
 			conn.SetWriteDeadline(time.Now().Add(time.Millisecond))
 			_, err := conn.Write(messages[i%len(messages)])
 			if err != nil {
