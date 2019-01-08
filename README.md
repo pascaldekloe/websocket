@@ -1,7 +1,8 @@
 [![API Documentation](https://godoc.org/github.com/pascaldekloe/websocket?status.svg)](https://godoc.org/github.com/pascaldekloe/websocket)
 [![Build Status](https://travis-ci.org/pascaldekloe/websocket.svg?branch=master)](https://travis-ci.org/pascaldekloe/websocket)
 
-A WebSocket library for the Go programming language.
+A high-performance WebSocket library for the Go programming language
+with built-in retry logic and timeout protection.
 
 This is free and unencumbered software released into the
 [public domain](http://creativecommons.org/publicdomain/zero/1.0).
@@ -9,8 +10,21 @@ This is free and unencumbered software released into the
 
 ### Use
 
+Most implementations will boot from an
+[HTTP Upgrade](https://godoc.org/github.com/pascaldekloe/websocket/httpws#Upgrade).
+
 ```go
 http.HandleFunc("/echo", func(resp http.ResponseWriter, req *http.Request) {
+	// client safety support
+	originCheck := func(s string, o *httpws.Origin) (pass bool) {
+		return o != nil && o.Host == "example.com" && o.Scheme == "https"
+	}
+	if !httpws.AllowOrigin(req, originCheck) {
+		http.Error(w, "HTTP Origin rejected", http.StatusForbidden)
+		return
+	}
+
+	// switch protocol to WebSocket
 	conn, err := httpws.Upgrade(resp, req, nil, time.Second)
 	if err != nil {
 		return
@@ -26,7 +40,7 @@ http.HandleFunc("/echo", func(resp http.ResponseWriter, req *http.Request) {
 		opcode, n, err := conn.Receive(buf[:], time.Second, time.Minute)
 		if err != nil {
 			if _, ok := err.(websocket.ClosedError); !ok && err != io.EOF {
-				log.Printf("receive error: %s", err)
+				log.Print("receive error: ", err)
 			}
 			return
 		}
@@ -35,7 +49,7 @@ http.HandleFunc("/echo", func(resp http.ResponseWriter, req *http.Request) {
 		err = conn.Send(opcode, buf[:n], time.Second)
 		if err != nil {
 			if _, ok := err.(websocket.ClosedError); !ok {
-				log.Printf("send error: %s", err)
+				log.Print("send error: ", err)
 			}
 			return
 		}
@@ -49,6 +63,14 @@ http.HandleFunc("/echo", func(resp http.ResponseWriter, req *http.Request) {
 The `/tcp` variants wire the raw messages to display WebSocket protocol overhead.
 
 ```
+name               time/op
+Receive/buffer-12   6.73µs ± 5%
+Receive/stream-12   45.7µs ± 3%
+Receive/tcp-12      6.28µs ± 3%
+Send/buffer-12      10.0µs ± 1%
+Send/stream-12      23.0µs ± 1%
+Send/tcp-12         10.0µs ± 1%
+
 name               speed
 Receive/buffer-12  888MB/s ± 5%
 Receive/stream-12  131MB/s ± 3%
