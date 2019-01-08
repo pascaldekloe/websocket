@@ -31,6 +31,8 @@ const (
 	statusCodeMask    = 0xffff
 )
 
+var byteOrder = binary.BigEndian
+
 // ErrRetry rejects a write. See method documentation!
 var errRetry = errors.New("websocket: retry after error with differend payload size")
 
@@ -73,7 +75,7 @@ type Conn struct {
 	// read mask byte position
 	maskI uint
 	// read mask key
-	mask uint32
+	mask uint64
 
 	// set once a close frame is send or received.
 	statusCode uint32
@@ -121,8 +123,7 @@ func (c *Conn) WriteClose(statusCode uint, reason string) error {
 			c.Conn.Write(c.writeBuf[:2])
 		default:
 			c.writeBuf[1] = byte(len(reason) + 2)
-			c.writeBuf[2] = byte(statusCode >> 8)
-			c.writeBuf[3] = byte(statusCode)
+			byteOrder.PutUint16(c.writeBuf[2:4], uint16(statusCode))
 			copy(c.writeBuf[4:], reason)
 			c.Conn.Write(c.writeBuf[:4+len(reason)])
 		}
@@ -233,13 +234,13 @@ func (c *Conn) write(p []byte) (n int, err error) {
 	} else if len(p) < 1<<16 {
 		// encode 16-bit payload length
 		c.writeBuf[1] = 126
-		binary.BigEndian.PutUint16(c.writeBuf[2:4], uint16(len(p)))
+		byteOrder.PutUint16(c.writeBuf[2:4], uint16(len(p)))
 		c.writeBufN = 4
 		c.writePayloadN = len(p)
 	} else {
 		// encode 64-bit payload length
 		c.writeBuf[1] = 127
-		binary.BigEndian.PutUint64(c.writeBuf[2:10], uint64(len(p)))
+		byteOrder.PutUint64(c.writeBuf[2:10], uint64(len(p)))
 		c.writeBufN = 10
 		c.writePayloadN = len(p)
 	}
@@ -379,27 +380,28 @@ func (c *Conn) nextFrame() error {
 		// non-control frame
 		switch c.readPayloadN {
 		default:
-			c.mask = maskOrder.Uint32(c.readBuf[2:6])
+			c.mask = uint64(byteOrder.Uint32(c.readBuf[2:6]))
 			c.readBufDone = 6
 		case 126:
 			if err := c.ensureBufN(8); err != nil {
 				return err
 			}
-			c.readPayloadN = int(binary.BigEndian.Uint16(c.readBuf[2:4]))
-			c.mask = maskOrder.Uint32(c.readBuf[4:8])
+			c.readPayloadN = int(byteOrder.Uint16(c.readBuf[2:4]))
+			c.mask = uint64(byteOrder.Uint32(c.readBuf[4:8]))
 			c.readBufDone = 8
 		case 127:
 			if err := c.ensureBufN(14); err != nil {
 				return err
 			}
-			size := binary.BigEndian.Uint64(c.readBuf[2:10])
+			size := byteOrder.Uint64(c.readBuf[2:10])
 			if size > uint64((^uint(0))>>1) {
 				return c.WriteClose(TooBig, "word size exceeded")
 			}
 			c.readPayloadN = int(size)
-			c.mask = maskOrder.Uint32(c.readBuf[10:14])
+			c.mask = uint64(byteOrder.Uint32(c.readBuf[10:14]))
 			c.readBufDone = 14
 		}
+		c.mask |= c.mask << 32
 		c.maskI = 0
 
 		return nil
@@ -417,7 +419,8 @@ func (c *Conn) nextFrame() error {
 	if err := c.ensureBufN(c.readPayloadN + 6); err != nil {
 		return err
 	}
-	c.mask = maskOrder.Uint32(c.readBuf[2:6])
+	c.mask = uint64(byteOrder.Uint32(c.readBuf[2:6]))
+	c.mask |= c.mask << 32
 	c.maskI = 0
 	c.readBufDone = 6
 
@@ -427,7 +430,7 @@ func (c *Conn) nextFrame() error {
 		if c.readPayloadN < 2 {
 			return c.WriteClose(NoStatusCode, "")
 		}
-		return c.WriteClose(uint(binary.BigEndian.Uint16(c.readBuf[6:8])), string(c.readBuf[8:6+c.readPayloadN]))
+		return c.WriteClose(uint(byteOrder.Uint16(c.readBuf[6:8])), string(c.readBuf[8:6+c.readPayloadN]))
 	}
 
 	return nil
@@ -456,29 +459,25 @@ func (c *Conn) ensureBufN(n int) error {
 	return nil
 }
 
-var maskOrder = binary.LittleEndian
-
 func (c *Conn) unmaskN(p []byte) {
 	if len(p) < 8 {
 		for i := range p {
-			p[i] ^= byte(c.mask >> ((c.maskI & 3) * 8))
+			p[i] ^= byte(c.mask >> ((^c.maskI & 3) * 8))
 			c.maskI++
 		}
 		return
 	}
 
-	word := uint64(c.mask)
-	word |= word << 32
-	word = bits.RotateLeft64(word, -int(8*c.maskI))
+	word := bits.RotateLeft64(c.mask, int(8*c.maskI))
 
 	var i int
 	for ; len(p)-i > 7; i += 8 {
-		maskOrder.PutUint64(p[i:], maskOrder.Uint64(p[i:])^word)
+		byteOrder.PutUint64(p[i:], byteOrder.Uint64(p[i:])^word)
 	}
 	// multipe of 8 does not change maskI
 
 	for ; i < len(p); i++ {
-		p[i] ^= byte(c.mask >> ((c.maskI & 3) * 8))
+		p[i] ^= byte(c.mask >> ((^c.maskI & 3) * 8))
 		c.maskI++
 	}
 }
