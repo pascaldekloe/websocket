@@ -269,7 +269,7 @@ func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) erro
 	return err
 }
 
-// Send is a high-level abstraction (from Write) for safety and convenience.
+// SendStream is a high-level abstraction (from Write) for safety and convenience.
 // The stream must be closed before any other call is made to either SendStream,
 // Send, Write or WriteMode.
 // WireTimeout is the limit for Write and Close [frame submission].
@@ -314,7 +314,7 @@ func (r readEOF) Read([]byte) (int, error) {
 }
 
 func (c *Conn) readWithRetry(p []byte, timeout time.Duration) (n int, opcode uint, final bool, err error) {
-	var retryDelay time.Duration = time.Microsecond
+	var retryDelay = time.Microsecond
 
 	for {
 		c.SetReadDeadline(time.Now().Add(timeout))
@@ -352,7 +352,7 @@ func (c *Conn) readWithRetry(p []byte, timeout time.Duration) (n int, opcode uin
 }
 
 func (c *Conn) writeWithRetry(p []byte, timeout time.Duration) (n int, err error) {
-	var retryDelay time.Duration = time.Microsecond
+	var retryDelay = time.Microsecond
 
 	c.SetWriteDeadline(time.Now().Add(timeout))
 	n, err = c.Write(p)
