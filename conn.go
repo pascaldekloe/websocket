@@ -8,7 +8,6 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"unicode/utf8"
 )
 
 // first (frame) byte layout
@@ -92,45 +91,6 @@ type Conn struct {
 
 func (c *Conn) setClose(statusCode uint, reason string) bool {
 	return atomic.CompareAndSwapUint32(&c.statusCode, 0, uint32(statusCode|statusCodeSetFlag))
-}
-
-// WriteClose sends a Close frame with best-effort. The return is a CloseError.
-// When the connectection already received or send a Close then only the first
-// status code remains in effect. The redundant status codes are discarded,
-// including any corresponding Close notifications.
-// Conn.Close must still be called, even after WriteClose.
-func (c *Conn) WriteClose(statusCode uint, reason string) error {
-	if !atomic.CompareAndSwapUint32(&c.statusCode, 0, uint32(statusCode|statusCodeSetFlag)) {
-		// already closed
-		return c.closeError()
-	}
-
-	// control frame payload limit is 125 bytes; status code takes 2
-	if len(reason) > 123 {
-		reason = reason[:123]
-	}
-	if !utf8.ValidString(reason) {
-		reason = ""
-	}
-
-	c.writeMutex.Lock()
-	// best effort close notification; no pending errors
-	if c.writeBufN == 0 && c.writePayloadN == 0 {
-		c.writeBuf[0] = Close | finalFlag
-		switch statusCode {
-		case NoStatusCode, AbnormalClose, 1015:
-			c.writeBuf[1] = 0
-			c.Conn.Write(c.writeBuf[:2])
-		default:
-			c.writeBuf[1] = byte(len(reason) + 2)
-			byteOrder.PutUint16(c.writeBuf[2:4], uint16(statusCode))
-			copy(c.writeBuf[4:], reason)
-			c.Conn.Write(c.writeBuf[:4+len(reason)])
-		}
-	}
-	c.writeMutex.Unlock()
-
-	return ClosedError(statusCode)
 }
 
 // CloseError returns an error if c is closed.
@@ -318,7 +278,7 @@ func (c *Conn) read(p []byte) (n int, err error) {
 		if c.readPayloadN != 0 {
 			err = io.ErrUnexpectedEOF
 		}
-		c.WriteClose(AbnormalClose, err.Error())
+		c.SendClose(AbnormalClose, err.Error())
 	}
 
 	return
@@ -343,11 +303,11 @@ func (c *Conn) nextFrame() error {
 	// sequence validation
 	if c.readFragmentation {
 		if head&opcodeMask != Continuation && head&ctrlFlag == 0 {
-			return c.WriteClose(ProtocolError, "fragmented message interrupted")
+			return c.SendClose(ProtocolError, "fragmented message interrupted")
 		}
 	} else {
 		if head&opcodeMask == Continuation {
-			return c.WriteClose(ProtocolError, "continuation of final message")
+			return c.SendClose(ProtocolError, "continuation of final message")
 		}
 	}
 	if head&ctrlFlag == 0 {
@@ -355,14 +315,14 @@ func (c *Conn) nextFrame() error {
 	}
 
 	if head&reservedMask != 0 {
-		return c.WriteClose(ProtocolError, "reserved bit set")
+		return c.SendClose(ProtocolError, "reserved bit set")
 	}
 
 	// second byte has mask flag and payload size
 	head2 := uint(c.readBuf[1])
 	c.readPayloadN = int(head2 & sizeMask)
 	if head2&maskFlag == 0 {
-		return c.WriteClose(ProtocolError, "no mask")
+		return c.SendClose(ProtocolError, "no mask")
 	}
 
 	if c.Accept != 0 && c.Accept&(1<<(head&opcodeMask)) == 0 {
@@ -373,7 +333,7 @@ func (c *Conn) nextFrame() error {
 		} else {
 			raeson = "opcode 1" + string('0'+opcode/10)
 		}
-		return c.WriteClose(CannotAccept, raeson)
+		return c.SendClose(CannotAccept, raeson)
 	}
 
 	if head&ctrlFlag == 0 {
@@ -395,7 +355,7 @@ func (c *Conn) nextFrame() error {
 			}
 			size := byteOrder.Uint64(c.readBuf[2:10])
 			if size > uint64((^uint(0))>>1) {
-				return c.WriteClose(TooBig, "word size exceeded")
+				return c.SendClose(TooBig, "word size exceeded")
 			}
 			c.readPayloadN = int(size)
 			c.mask = uint64(byteOrder.Uint32(c.readBuf[10:14]))
@@ -409,11 +369,11 @@ func (c *Conn) nextFrame() error {
 	// control frame
 
 	if head&finalFlag == 0 {
-		return c.WriteClose(ProtocolError, "control frame not final")
+		return c.SendClose(ProtocolError, "control frame not final")
 	}
 
 	if c.readPayloadN > 125 {
-		return c.WriteClose(ProtocolError, "control frame size")
+		return c.SendClose(ProtocolError, "control frame size")
 	}
 
 	if err := c.ensureBufN(c.readPayloadN + 6); err != nil {
@@ -428,9 +388,9 @@ func (c *Conn) nextFrame() error {
 
 	if head&opcodeMask == Close {
 		if c.readPayloadN < 2 {
-			return c.WriteClose(NoStatusCode, "")
+			return c.SendClose(NoStatusCode, "")
 		}
-		return c.WriteClose(uint(byteOrder.Uint16(c.readBuf[6:8])), string(c.readBuf[8:6+c.readPayloadN]))
+		return c.SendClose(uint(byteOrder.Uint16(c.readBuf[6:8])), string(c.readBuf[8:6+c.readPayloadN]))
 	}
 
 	return nil
@@ -447,7 +407,7 @@ func (c *Conn) ensureBufN(n int) error {
 				if c.readBufN != 0 {
 					err = io.ErrUnexpectedEOF
 				}
-				c.WriteClose(AbnormalClose, err.Error())
+				c.SendClose(AbnormalClose, err.Error())
 				if c.readBufN >= n {
 					return nil
 				}

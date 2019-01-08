@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -106,6 +107,47 @@ func (e ClosedError) Timeout() bool { return false }
 // Temporary honors the net.Error interface.
 func (e ClosedError) Temporary() bool { return false }
 
+// SendClose is a high-level abstraction for safety and convenience. The client
+// is notified on best effort basis, including the optional free-form reason.
+// Use 123 bytes of UTF-8 or less for submission.
+//
+// When the connectection already received or send a Close then only the first
+// status code remains in effect. Redundant status codes are discarded.
+// The return always is a CloseError with the first status code.
+//
+// Multiple goroutines may invoke SendClose simultaneously. SendClose may be
+// invoked simultaneously with any other method from Conn.
+func (c *Conn) SendClose(statusCode uint, reason string) error {
+	if !atomic.CompareAndSwapUint32(&c.statusCode, 0, uint32(statusCode|statusCodeSetFlag)) {
+		// already closed
+		return c.closeError()
+	}
+
+	// control frame payload limit is 125 bytes; status code takes 2
+	if len(reason) > 123 || !utf8.ValidString(reason) {
+		reason = ""
+	}
+
+	c.writeMutex.Lock()
+	// best effort close notification; no pending errors
+	if c.writeBufN == 0 && c.writePayloadN == 0 {
+		c.writeBuf[0] = Close | finalFlag
+		switch statusCode {
+		case NoStatusCode, AbnormalClose, 1015:
+			c.writeBuf[1] = 0
+			c.Conn.Write(c.writeBuf[:2])
+		default:
+			c.writeBuf[1] = byte(len(reason) + 2)
+			byteOrder.PutUint16(c.writeBuf[2:4], uint16(statusCode))
+			copy(c.writeBuf[4:], reason)
+			c.Conn.Write(c.writeBuf[:4+len(reason)])
+		}
+	}
+	c.writeMutex.Unlock()
+
+	return ClosedError(statusCode)
+}
+
 // ErrOverflow signals an incomming message larger than the provided buffer.
 var ErrOverflow = errors.New("websocket: message exceeds buffer size")
 
@@ -127,7 +169,7 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 
 	for !final {
 		if n >= len(buf) {
-			c.WriteClose(TooBig, "")
+			c.SendClose(TooBig, "")
 			return opcode, n, ErrOverflow
 		}
 
@@ -258,53 +300,72 @@ func (r *textReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Send is a high-level abstraction (from Write) for safety and convenience.
-// Operation must complete before any other call is made to either Send,
-// SendStream, Write or WriteMode.
-// WireTimeout is the limit for Write [frame submission].
+// Send is a high-level abstraction for safety and convenience.
+// The opcode must be in range [1, 15] like Text, Binary or Ping.
+// WireTimeout limits the frame transmission time. On expiry, the connection
+// is closed with status code 1008 [Policy].
+// All error returns are fatal to the connection.
+//
+// Multiple goroutines may invoke Send simultaneously. Send may be invoked
+// simultaneously with any other high-level method from Conn. Note that when
+// Send interrupts SendStream, then the opcode of Send is further reduced to
+// range [8, 15]. Simultaneous invokation of any of the low-level net.Conn
+// methods can currupt the connection state.
 func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) error {
+	c.writeMutex.Lock()
 	c.SetWriteMode(opcode, true)
-
 	_, err := c.writeWithRetry(message, wireTimeout)
+	c.writeMutex.Unlock()
 	return err
 }
 
-// SendStream is a high-level abstraction (from Write) for safety and convenience.
-// The stream must be closed before any other call is made to either SendStream,
-// Send, Write or WriteMode.
-// WireTimeout is the limit for Write and Close [frame submission].
+// SendStream is an alternative to Send.
+// The opcode must be in range [1, 7] like Text or Binary.
+// WireTimeout limits the frame transmission time. On expiry, the connection
+// is closed with status code 1008 [Policy].
+// All errors from the io.WriteCloser other than io.ErrClosedPipe are fatal to
+// the connection.
+//
+// The stream must be closed before any other invocation to SendStream is made
+// and Send may only interrupt with control frames—opcode range [8, 15].
+// Multiple goroutines may invoke the io.WriteCloser methods simultaneously.
+// Simultaneous invokation of either SendStream or the io.WriteCloser with any
+// of the low-level net.Conn methods can currupt the connection state.
 func (c *Conn) SendStream(opcode uint, wireTimeout time.Duration) io.WriteCloser {
 	c.SetWriteMode(opcode, false)
-	return &messageWriter{conn: c, wireTimeout: wireTimeout}
+	return &messageWriter{c, wireTimeout, opcode}
 }
 
 type messageWriter struct {
 	conn        *Conn
 	wireTimeout time.Duration
-	closed      bool
+	opcode      uint
 }
 
 func (w *messageWriter) Write(p []byte) (n int, err error) {
-	if w.closed {
-		return 0, io.ErrClosedPipe
+	w.conn.writeMutex.Lock()
+	if w.opcode == Close {
+		err = io.ErrClosedPipe
+	} else {
+		w.conn.SetWriteMode(w.opcode, false)
+		w.opcode = Continuation
+		n, err = w.conn.writeWithRetry(p, w.wireTimeout)
 	}
+	w.conn.writeMutex.Unlock()
 
-	return w.conn.writeWithRetry(p, w.wireTimeout)
+	return
 }
 
-func (w messageWriter) Close() error {
-	if w.closed {
-		return nil
+func (w messageWriter) Close() (err error) {
+	w.conn.writeMutex.Lock()
+	if w.opcode != Close {
+		w.conn.SetWriteMode(w.opcode, true)
+		w.opcode = Close
+		_, err = w.conn.writeWithRetry(nil, w.wireTimeout)
 	}
+	w.conn.writeMutex.Unlock()
 
-	w.conn.writeHead |= finalFlag
-
-	_, err := w.Write(nil)
-	if err != nil {
-		return err
-	}
-	w.closed = true
-	return nil
+	return
 }
 
 type readEOF struct{}
@@ -322,7 +383,7 @@ func (c *Conn) readWithRetry(p []byte, timeout time.Duration) (n int, opcode uin
 		for err != nil {
 			e, ok := err.(net.Error)
 			if ok && e.Timeout() {
-				c.WriteClose(Policy, "read timeout")
+				c.SendClose(Policy, "read timeout")
 				return
 			}
 			if !ok || !e.Temporary() {
@@ -351,15 +412,17 @@ func (c *Conn) readWithRetry(p []byte, timeout time.Duration) (n int, opcode uin
 	}
 }
 
+// caller must hold the writeMutex lock
 func (c *Conn) writeWithRetry(p []byte, timeout time.Duration) (n int, err error) {
 	var retryDelay = time.Microsecond
 
 	c.SetWriteDeadline(time.Now().Add(timeout))
-	n, err = c.Write(p)
+	n, err = c.write(p)
 	for err != nil {
 		e, ok := err.(net.Error)
 		if ok && e.Timeout() {
 			c.setClose(Policy, "write timeout")
+			return
 		}
 		if !ok || !e.Temporary() {
 			return
@@ -371,7 +434,7 @@ func (c *Conn) writeWithRetry(p []byte, timeout time.Duration) (n int, err error
 		}
 
 		var more int
-		more, err = c.Write(p[n:])
+		more, err = c.write(p[n:])
 		n += more
 	}
 
