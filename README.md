@@ -7,6 +7,43 @@ This is free and unencumbered software released into the
 [public domain](http://creativecommons.org/publicdomain/zero/1.0).
 
 
+### Use
+
+```go
+http.HandleFunc("/echo", func(resp http.ResponseWriter, req *http.Request) {
+	conn, err := httpws.Upgrade(resp, req, nil, time.Second)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	// limit to standard types
+	conn.Accept = websocket.AcceptV13
+
+	var buf [2048]byte
+	for {
+		// read message
+		opcode, n, err := conn.Receive(buf[:], time.Second, time.Minute)
+		if err != nil {
+			if _, ok := err.(websocket.ClosedError); !ok && err != io.EOF {
+				log.Printf("receive error: %s", err)
+			}
+			return
+		}
+
+		// write message
+		err = conn.Send(opcode, buf[:n], time.Second)
+		if err != nil {
+			if _, ok := err.(websocket.ClosedError); !ok {
+				log.Printf("send error: %s", err)
+			}
+			return
+		}
+	}
+})
+```
+
+
 ### Performance on a Mac Pro (late 2013)
 
 The `/tcp` variants wire the raw messages to display WebSocket protocol overhead.
