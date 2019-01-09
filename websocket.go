@@ -123,20 +123,22 @@ func (c *Conn) SendClose(statusCode uint, reason string) error {
 		return c.closeError()
 	}
 
+	// “range 0-999 are not used” and the others “MUST NOT be set”
+	send := statusCode > 999 && statusCode != NoStatusCode && statusCode != AbnormalClose && statusCode != 1015
+
 	// control frame payload limit is 125 bytes; status code takes 2
-	if len(reason) > 123 || !utf8.ValidString(reason) {
-		reason = ""
+	if send && (len(reason) > 123 || !utf8.ValidString(reason)) {
+		send = false
 	}
 
 	c.writeMutex.Lock()
 	// best effort close notification; no pending errors
 	if c.writeBufN == 0 && c.writePayloadN == 0 {
 		c.writeBuf[0] = Close | finalFlag
-		switch statusCode {
-		case NoStatusCode, AbnormalClose, 1015:
+		if !send {
 			c.writeBuf[1] = 0
 			c.Conn.Write(c.writeBuf[:2])
-		default:
+		} else {
 			c.writeBuf[1] = byte(len(reason) + 2)
 			byteOrder.PutUint16(c.writeBuf[2:4], uint16(statusCode))
 			copy(c.writeBuf[4:], reason)
