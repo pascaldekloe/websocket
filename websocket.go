@@ -261,7 +261,10 @@ var ErrOverflow = errors.New("websocket: message exceeds buffer size")
 func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opcode uint, n int, err error) {
 	n, opcode, final, err := c.readWithRetry(buf, idleTimeout)
 	if err != nil {
-		return opcode, 0, err
+		return opcode, n, err
+	}
+	if opcode == Continuation {
+		return opcode, n, c.SendClose(ProtocolError, "anonymous continuation")
 	}
 
 	for !final {
@@ -270,12 +273,15 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 			return opcode, n, ErrOverflow
 		}
 
-		var more int
-		more, _, final, err = c.readWithRetry(buf[n:], wireTimeout)
+		more, opcode, moreFinal, err := c.readWithRetry(buf[n:], wireTimeout)
+		if opcode != Continuation { // also valid when err != nil
+			return opcode, n, c.SendClose(ProtocolError, "fragmented message interrupted")
+		}
 		n += more
 		if err != nil {
 			return opcode, n, err
 		}
+		final = moreFinal
 	}
 
 	if opcode == Text && !utf8.Valid(buf[:n]) {
@@ -299,6 +305,9 @@ func (c *Conn) ReceiveStream(wireTimeout, idleTimeout time.Duration) (opcode uin
 	_, opcode, final, err := c.readWithRetry(nil, idleTimeout)
 	if err != nil {
 		return 0, nil, err
+	}
+	if opcode == Continuation {
+		return 0, nil, c.SendClose(ProtocolError, "anonymous continuation")
 	}
 
 	switch {
@@ -329,7 +338,10 @@ func (r *messageReader) Read(p []byte) (n int, err error) {
 		return 0, r.err
 	}
 
-	n, _, final, err := r.conn.readWithRetry(p, r.wireTimeout)
+	n, opcode, final, err := r.conn.readWithRetry(p, r.wireTimeout)
+	if opcode != Continuation { // also valid when err != nil
+		return 0, r.conn.SendClose(ProtocolError, "fragmented message interrupted")
+	}
 	if final {
 		r.err = io.EOF
 		if err == nil {
@@ -362,7 +374,10 @@ func (r *textReader) Read(p []byte) (n int, err error) {
 	}
 
 	// actual read
-	more, _, final, err := r.conn.readWithRetry(p[n:], r.wireTimeout)
+	more, opcode, final, err := r.conn.readWithRetry(p[n:], r.wireTimeout)
+	if opcode != Continuation { // also valid when err != nil
+		return n, r.conn.SendClose(ProtocolError, "fragmented message interrupted")
+	}
 	n += more
 
 	// validation overrules I/O errors; received payload shoud be valid

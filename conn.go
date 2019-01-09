@@ -69,8 +69,6 @@ type Conn struct {
 	// first byte of next frame written
 	writeHead uint32
 
-	readFragmentation bool
-
 	// read mask byte position
 	maskI uint
 	// read mask key
@@ -181,11 +179,7 @@ func (c *Conn) write(p []byte) (n int, err error) {
 	}
 
 	// load buffer with header
-	head := atomic.LoadUint32(&c.writeHead)
-	c.writeBuf[0] = byte(head)
-	if head&finalFlag == 0 && head&opcodeMask != Continuation {
-		atomic.StoreUint32(&c.writeHead, Continuation|head&reservedMask)
-	}
+	c.writeBuf[0] = byte(atomic.LoadUint32(&c.writeHead))
 	if len(p) < 126 {
 		// frame fits buffer; send one packet
 		c.writeBuf[1] = byte(len(p))
@@ -252,6 +246,9 @@ func (c *Conn) read(p []byte) (n int, err error) {
 		if err != nil {
 			return 0, err
 		}
+	} else {
+		// set opcode to Continue/zero
+		atomic.StoreUint32(&c.readHead, atomic.LoadUint32(&c.readHead)&finalFlag)
 	}
 
 	// limit read to payload size
@@ -299,20 +296,6 @@ func (c *Conn) nextFrame() error {
 	// get frame header
 	head := uint(c.readBuf[0])
 	atomic.StoreUint32(&c.readHead, uint32(head))
-
-	// sequence validation
-	if c.readFragmentation {
-		if head&opcodeMask != Continuation && head&ctrlFlag == 0 {
-			return c.SendClose(ProtocolError, "fragmented message interrupted")
-		}
-	} else {
-		if head&opcodeMask == Continuation {
-			return c.SendClose(ProtocolError, "continuation of final message")
-		}
-	}
-	if head&ctrlFlag == 0 {
-		c.readFragmentation = head&finalFlag == 0
-	}
 
 	if head&reservedMask != 0 {
 		return c.SendClose(ProtocolError, "reserved bit set")

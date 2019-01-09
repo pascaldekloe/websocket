@@ -93,7 +93,7 @@ func TestRead(t *testing.T) {
 
 		// collect message
 		var got []byte
-		for readCount := 1; ; readCount++ {
+		for readCount := 0; ; readCount++ {
 			buf := make([]byte, 1024)
 			n, err := conn.Read(buf)
 			if err != nil {
@@ -103,8 +103,10 @@ func TestRead(t *testing.T) {
 			got = append(got, buf[:n]...)
 
 			opcode, final := conn.ReadMode()
-			if opcode != gold.Opcode {
+			if readCount == 0 && opcode != gold.Opcode {
 				t.Errorf("%#x: connection read %d got opcode %d, want %d", gold.Masked, readCount, opcode, gold.Opcode)
+			} else if readCount != 0 && opcode != Continuation {
+				t.Errorf("%#x: connection read %d got opcode %d, want %d", gold.Masked, readCount, opcode, Continuation)
 			}
 			if final {
 				break
