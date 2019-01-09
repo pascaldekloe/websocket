@@ -75,8 +75,7 @@ const (
 	Unexpected = 1011
 )
 
-// ErrUTF8 signals malformed text.
-var ErrUTF8 = errors.New("websocket: invalid UTF-8 sequence")
+var errUTF8 = errors.New("websocket: invalid UTF-8 sequence in text payload")
 
 // ClosedError is a status code. Atomic Close support prevents Go issue 4373.
 // Even after receiving a ClosedError, Conn.Close must still be called.
@@ -174,7 +173,7 @@ func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) erro
 // WireTimeout limits the frame transmission time. On expiry, the connection
 // is closed with status code 1008 [Policy].
 // All errors from the io.WriteCloser other than io.ErrClosedPipe are fatal to
-// the connection.
+// the connection. Check Close for errors too!
 //
 // The stream must be closed before any other invocation to SendStream is made
 // and Send may only interrupt with control frames—opcode range [8, 15].
@@ -183,7 +182,12 @@ func (c *Conn) Send(opcode uint, message []byte, wireTimeout time.Duration) erro
 // of the low-level net.Conn methods can currupt the connection state.
 func (c *Conn) SendStream(opcode uint, wireTimeout time.Duration) io.WriteCloser {
 	c.SetWriteMode(opcode, false)
-	return &messageWriter{c, wireTimeout, opcode}
+	switch opcode {
+	default:
+		return &messageWriter{c, wireTimeout, opcode}
+	case Text:
+		return &textWriter{conn: c, wireTimeout: wireTimeout, opcode: opcode}
+	}
 }
 
 type messageWriter struct {
@@ -207,6 +211,85 @@ func (w *messageWriter) Write(p []byte) (n int, err error) {
 }
 
 func (w messageWriter) Close() (err error) {
+	w.conn.writeMutex.Lock()
+	if w.opcode != Close {
+		w.conn.SetWriteMode(w.opcode, true)
+		w.opcode = Close
+		_, err = w.conn.writeWithRetry(nil, w.wireTimeout)
+	}
+	w.conn.writeMutex.Unlock()
+
+	return
+}
+
+type textWriter struct {
+	conn        *Conn
+	wireTimeout time.Duration
+	opcode      uint
+	remain      [utf8.UTFMax]byte
+	remainN     int
+}
+
+func (w *textWriter) Write(p []byte) (n int, err error) {
+	w.conn.writeMutex.Lock()
+
+	if w.opcode == Close {
+		w.conn.writeMutex.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+
+	// complete partial UTF-8 sequence if there's any
+	for w.remainN != 0 {
+		if n >= len(p) {
+			return // consumed entire payload
+		}
+
+		// add one byte
+		w.remain[w.remainN] = p[n]
+		w.remainN++
+		n++
+
+		r, _ := utf8.DecodeRune(w.remain[:w.remainN])
+		if r != utf8.RuneError {
+			p = append(w.remain[:w.remainN], p...)
+			n -= w.remainN // makes n negative
+			w.remainN = 0
+		} else if w.remainN >= utf8.UTFMax {
+			return n, errUTF8
+		}
+	}
+
+	// determine last complete rune end
+	end := len(p)
+	if !utf8.Valid(p) {
+		for end--; end >= 0; end-- {
+			if p[end]&0xc0 != 0xc0 {
+				break // multi-byte start
+			}
+		}
+
+		if end < len(p)-utf8.UTFMax || !utf8.Valid(p[:end]) {
+			return n, errUTF8
+		}
+	}
+
+	w.conn.SetWriteMode(w.opcode, false)
+	w.opcode = Continuation
+
+	done, err := w.conn.writeWithRetry(p, w.wireTimeout)
+	n += done
+
+	w.remainN = copy(w.remain[:], p[end:])
+
+	w.conn.writeMutex.Unlock()
+	return n, err
+}
+
+func (w textWriter) Close() (err error) {
+	if w.remainN != 0 {
+		return errUTF8
+	}
+
 	w.conn.writeMutex.Lock()
 	if w.opcode != Close {
 		w.conn.SetWriteMode(w.opcode, true)
@@ -287,7 +370,7 @@ func (c *Conn) Receive(buf []byte, wireTimeout, idleTimeout time.Duration) (opco
 	}
 
 	if opcode == Text && !utf8.Valid(buf[:n]) {
-		return opcode, n, ErrUTF8
+		return opcode, n, errUTF8
 	}
 
 	return opcode, n, nil
@@ -385,7 +468,7 @@ func (r *textReader) Read(p []byte) (n int, err error) {
 	// validation overrules I/O errors; received payload shoud be valid
 	if !utf8.Valid(p[:n]) {
 		if final {
-			return n, ErrUTF8
+			return n, errUTF8
 		}
 		// last rune might be partial
 
@@ -397,7 +480,7 @@ func (r *textReader) Read(p []byte) (n int, err error) {
 		}
 
 		if end+utf8.UTFMax >= n || !utf8.Valid(p[:end]) {
-			return n, ErrUTF8
+			return n, errUTF8
 		}
 
 		r.tailN = copy(r.tail[:], p[end:])
