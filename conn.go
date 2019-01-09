@@ -288,24 +288,26 @@ func (c *Conn) nextFrame() error {
 		c.readBufDone = 0
 	}
 
-	if err := c.ensureBufN(6); err != nil {
-		// TODO: check mask missing?
+	err := c.ensureBufN(6)
+	// delay error check for missing mask case
+	if c.readBufN >= 2 {
+		// second octet contains mask flag and payload size
+		o := int(c.readBuf[1])
+		c.readPayloadN = o & sizeMask
+		if o&maskFlag == 0 {
+			return c.SendClose(ProtocolError, "no mask")
+		}
+	}
+	if err != nil {
 		return err
 	}
 
-	// get frame header
+	// first octet contains final flag, reserved bits and opcode
 	head := uint(c.readBuf[0])
 	atomic.StoreUint32(&c.readHead, uint32(head))
 
 	if head&reservedMask != 0 {
 		return c.SendClose(ProtocolError, "reserved bit set")
-	}
-
-	// second byte has mask flag and payload size
-	head2 := uint(c.readBuf[1])
-	c.readPayloadN = int(head2 & sizeMask)
-	if head2&maskFlag == 0 {
-		return c.SendClose(ProtocolError, "no mask")
 	}
 
 	if c.Accept != 0 && c.Accept&(1<<(head&opcodeMask)) == 0 {
