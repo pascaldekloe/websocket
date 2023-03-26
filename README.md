@@ -1,5 +1,4 @@
-[![API Documentation](https://godoc.org/github.com/pascaldekloe/websocket?status.svg)](https://godoc.org/github.com/pascaldekloe/websocket)
-[![Build Status](https://travis-ci.org/pascaldekloe/websocket.svg?branch=master)](https://travis-ci.org/pascaldekloe/websocket)
+## About
 
 A high-performance WebSocket library for the Go programming language
 with built-in retry logic and timeout protection.
@@ -7,8 +6,11 @@ with built-in retry logic and timeout protection.
 This is free and unencumbered software released into the
 [public domain](http://creativecommons.org/publicdomain/zero/1.0).
 
+[![API](https://pkg.go.dev/badge/github.com/pascaldekloe/websocket.svg)](https://pkg.go.dev/github.com/pascaldekloe/websocket)
+[![CI](https://github.com/pascaldekloe/websocket/actions/workflows/go.yml/badge.svg)](https://github.com/pascaldekloe/websocket/actions/workflows/go.yml)
 
-### Use
+
+## Use
 
 Most implementations will boot from an
 [HTTP Upgrade](https://godoc.org/github.com/pascaldekloe/websocket/httpws#Upgrade).
@@ -58,7 +60,7 @@ http.HandleFunc("/echo", func(resp http.ResponseWriter, req *http.Request) {
 ```
 
 
-### Performance on a Mac Pro (late 2013)
+## Performance
 
 The `/tcp` variants wire the raw messages to display WebSocket protocol overhead.
 
