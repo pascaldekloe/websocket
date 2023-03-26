@@ -3,6 +3,7 @@ package websocket
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync/atomic"
@@ -83,21 +84,14 @@ type ClosedError uint
 
 // Error honors the error interface.
 func (e ClosedError) Error() string {
-	msg := "websocket: connection closed"
 	switch e {
 	case NoStatusCode:
-		break
+		return "websocket: connection closed"
 	case AbnormalClose:
-		msg += " abnormally"
+		return "websocket: connection closed abnormally"
 	default:
-		msg += ", status code "
-		if e >= 10000 {
-			msg += string('0' + (e/10000)%10)
-		}
-		msg += string('0'+(e/1000)%10) + string('0'+(e/100)%10) + string('0'+(e/10)%10) + string('0'+(e)%10)
+		return fmt.Sprintf("websocket: connection closed, status code %04d", e)
 	}
-
-	return msg
 }
 
 // Timeout honors the net.Error interface.

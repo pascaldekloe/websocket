@@ -3,6 +3,7 @@ package websocket
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/bits"
 	"net"
@@ -311,14 +312,7 @@ func (c *Conn) nextFrame() error {
 	}
 
 	if c.Accept != 0 && c.Accept&(1<<(head&opcodeMask)) == 0 {
-		var raeson string
-		opcode := head & opcodeMask
-		if opcode < 10 {
-			raeson = "opcode " + string('0'+opcode)
-		} else {
-			raeson = "opcode 1" + string('0'+opcode/10)
-		}
-		return c.SendClose(CannotAccept, raeson)
+		return c.SendClose(CannotAccept, fmt.Sprintf("opcode %d", head&opcodeMask))
 	}
 
 	if head&ctrlFlag == 0 {
