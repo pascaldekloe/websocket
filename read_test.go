@@ -14,6 +14,8 @@ func TestSmallReads(t *testing.T) {
 
 	// get one byte at a time
 	mock := iotest.OneByteReader(strings.NewReader(frame))
+	// combine last read with EOF
+	mock = iotest.DataErrReader(mock)
 
 	r := NewReader(make([]byte, 4096))
 	for i := 0; i < len(frame)-1; i++ {

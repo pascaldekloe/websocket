@@ -19,6 +19,7 @@ var ErrReserved = errors.New("WebSocket frame with reserved flags")
 // Reader can not handle frames beyond its buffer in size.
 type Reader struct {
 	buf []byte
+	err error // pending from last read
 
 	bufI int // index of position in buffer
 	bufN int // byte count of buffered data
@@ -45,8 +46,14 @@ func (r *Reader) passFrame() {
 	}
 }
 
-// ReadSome does one Read. Errors are from r, if any.
+// ReadSome does one Read. Errors come from conn exclusively. Read may, however,
+// delay an error from conn until the next invocation in exceptional cases.
 func (r *Reader) ReadSome(conn io.Reader) error {
+	if err := r.err; err != nil {
+		r.err = nil // clear
+		return err
+	}
+
 	if r.bufI > 0 && len(r.buf)-r.bufN < 1024 {
 		// move to buffer start
 		r.bufN = copy(r.buf, r.buf[r.bufI:r.bufN])
@@ -57,10 +64,13 @@ func (r *Reader) ReadSome(conn io.Reader) error {
 	if r.bufN < len(r.buf) {
 		// got buffer space to fil
 		n, err := conn.Read(r.buf[r.bufN:])
+		if n == 0 {
+			return err
+		}
 		r.bufN += n
-		return err
+		r.err = err
 	}
-	return nil // full
+	return nil
 }
 
 // IsFinal returns whether the current frame is the last one of the message.
