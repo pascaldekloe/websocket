@@ -324,9 +324,6 @@ func (c *Conn) writeWithRetry(p []byte, timeout time.Duration) (n int, err error
 	return
 }
 
-// ErrOverflow signals an incomming message larger than the provided buffer.
-var ErrOverflow = errors.New("websocket: message exceeds buffer size")
-
 // Receive is a high-level abstraction (from Read) for safety and convenience.
 // The opcode return is in range [1, 7]. Control frames are dealed with.
 // Size defines the amount of bytes in Reader or negative when unknown.
